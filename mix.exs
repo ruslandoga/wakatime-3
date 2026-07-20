@@ -24,7 +24,10 @@ defmodule W3.MixProject do
     [
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:bandit, "~> 1.12"},
-      {:adbc, "~> 0.12.1"}
+      {:adbc, "~> 0.12.1"},
+      {:req, "~> 0.6.3"},
+      {:req_s3, "~> 0.2.4"},
+      {:nimble_options, "~> 1.1"}
     ]
   end
 end

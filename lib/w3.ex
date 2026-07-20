@@ -3,16 +3,14 @@ defmodule W3 do
   Documentation for `W3`.
   """
 
-  @doc """
-  Hello world.
+  def list_remote do
+  end
 
-  ## Examples
+  def list_local do
+  end
 
-      iex> W3.hello()
-      :world
-
-  """
-  def hello do
-    :world
+  def query(sql, params \\ []) do
+    result = Adbc.Connection.query!(W3.DuckConn, sql, params)
+    Adbc.Result.to_map(result)
   end
 end
