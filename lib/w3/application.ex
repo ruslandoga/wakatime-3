@@ -1,19 +1,17 @@
 defmodule W3.Application do
-  # See https://hexdocs.pm/elixir/Application.html
-  # for more information on OTP Applications
   @moduledoc false
-
   use Application
 
   @impl true
   def start(_type, _args) do
+    _scheme = Application.fetch_env!(:w3, :http_scheme)
+    _port = Application.fetch_env!(:w3, :http_port)
+
     children = [
-      # Starts a worker by calling: W3.Worker.start_link(arg)
-      # {W3.Worker, arg}
+      {Adbc.Database, driver: :duckdb, process_options: [name: W3.DuckDB]},
+      {Adbc.Connection, database: W3.DuckDB, process_options: [name: W3.DuckConn]}
     ]
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
     opts = [strategy: :one_for_one, name: W3.Supervisor]
     Supervisor.start_link(children, opts)
   end
