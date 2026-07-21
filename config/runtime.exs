@@ -19,4 +19,7 @@ http_port =
             "Invalid HTTP_PORT: #{http_port_raw}. Must be a valid port number (1-65535)."
   end
 
-config :w3, http_scheme: http_scheme, http_port: http_port
+config :w3,
+  http_scheme: http_scheme,
+  http_port: http_port,
+  api_key: System.get_env("API_KEY")
