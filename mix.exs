@@ -12,7 +12,8 @@ defmodule W3.MixProject do
       test_coverage: [ignore_modules: [Help]],
       dialyzer: [
         plt_local_path: "plts",
-        plt_core_path: "plts"
+        plt_core_path: "plts",
+        plt_add_apps: [:ex_unit]
       ]
     ]
   end
