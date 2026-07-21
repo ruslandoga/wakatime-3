@@ -6,6 +6,7 @@ defmodule W3.MixProject do
       app: :w3,
       version: "0.1.0",
       elixir: "~> 1.20",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]
@@ -19,12 +20,17 @@ defmodule W3.MixProject do
     ]
   end
 
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_env), do: ["lib"]
+
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:bandit, "~> 1.12"},
-      {:adbc, "~> 0.12.1"}
+      {:adbc, "~> 0.12.1"},
+      {:req, "~> 0.6.3"},
+      {:req_s3, "~> 0.2.4"}
     ]
   end
 end
