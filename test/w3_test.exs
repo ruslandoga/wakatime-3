@@ -7,6 +7,7 @@ defmodule W3Test do
     {:ok, s3_req: s3_req}
   end
 
+  @tag :minio
   test "s3 create bucket, put and get object, delete bucket", %{s3_req: s3_req} do
     # Create bucket and delete on exit
     on_exit(fn -> Req.delete!(s3_req, url: "s3://w3-test-bucket") end)
