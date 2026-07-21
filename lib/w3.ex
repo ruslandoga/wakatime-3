@@ -1,18 +1,10 @@
 defmodule W3 do
   @moduledoc """
-  Documentation for `W3`.
+  TODO
   """
 
-  @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> W3.hello()
-      :world
-
-  """
-  def hello do
-    :world
+  def query(sql, params \\ []) do
+    result = Adbc.Connection.query!(W3.DuckConn, sql, params)
+    Adbc.Result.to_map(result)
   end
 end

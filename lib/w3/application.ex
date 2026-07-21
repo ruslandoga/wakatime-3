@@ -4,12 +4,12 @@ defmodule W3.Application do
 
   @impl true
   def start(_type, _args) do
-    _scheme = Application.fetch_env!(:w3, :http_scheme)
-    _port = Application.fetch_env!(:w3, :http_port)
+    http_uri = Application.fetch_env!(:w3, :http_uri)
+    data_path = Application.fetch_env!(:w3, :data_path)
 
     children = [
-      {Adbc.Database, driver: :duckdb, process_options: [name: W3.DuckDB]},
-      {Adbc.Connection, database: W3.DuckDB, process_options: [name: W3.DuckConn]}
+      {W3.Endpoint, uri: http_uri, data_path: data_path},
+      {W3.Compactor, data_path: data_path}
     ]
 
     opts = [strategy: :one_for_one, name: W3.Supervisor]
