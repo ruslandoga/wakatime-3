@@ -1,13 +1,7 @@
 defmodule W3 do
   @moduledoc """
-  Documentation for `W3`.
+  TODO
   """
-
-  def list_remote do
-  end
-
-  def list_local do
-  end
 
   def query(sql, params \\ []) do
     result = Adbc.Connection.query!(W3.DuckConn, sql, params)
