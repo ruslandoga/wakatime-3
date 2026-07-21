@@ -18,5 +18,8 @@ defmodule W3.EndpointTest do
 
     assert %Req.Response{status: 200, body: "hello world"} =
              Req.get!(url <> "hello/world", auth: {:basic, "some_api_key"})
+
+    assert %Req.Response{status: 404, body: "not found"} =
+             Req.get!(url <> "unknown/path", auth: {:basic, "some_api_key"})
   end
 end
