@@ -30,7 +30,8 @@ defmodule W3.MixProject do
       {:bandit, "~> 1.12"},
       {:adbc, "~> 0.12.1"},
       {:req, "~> 0.6.3"},
-      {:req_s3, "~> 0.2.4"}
+      {:req_s3, "~> 0.2.4"},
+      {:telemetry, "~> 1.4"}
     ]
   end
 end
