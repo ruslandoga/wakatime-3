@@ -8,7 +8,12 @@ defmodule W3.MixProject do
       elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      test_coverage: [ignore_modules: [Help]],
+      dialyzer: [
+        plt_local_path: "plts",
+        plt_core_path: "plts"
+      ]
     ]
   end
 
