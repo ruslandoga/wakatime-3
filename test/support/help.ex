@@ -1,4 +1,6 @@
 defmodule Help do
+  @moduledoc false
+
   def s3_credentials(:minio) do
     %{
       access_key_id: System.get_env("AWS_ACCESS_KEY_ID", "minioadmin"),
