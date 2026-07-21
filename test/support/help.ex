@@ -30,6 +30,7 @@ defmodule Help do
       options
       |> Keyword.put_new(:port, 0)
       |> Keyword.put_new(:api_key, "test_api_key")
+      |> Keyword.put_new(:startup_log, false)
 
     pid = ExUnit.Callbacks.start_supervised!({W3.Endpoint, options})
     {:ok, {_ip, port}} = ThousandIsland.listener_info(pid)

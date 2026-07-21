@@ -3,15 +3,8 @@ defmodule W3.Endpoint do
   use Plug.Router
 
   def start_link(options) do
-    scheme = Keyword.get(options, :scheme, :http)
-    port = Keyword.fetch!(options, :port)
-    api_key = Keyword.fetch!(options, :api_key)
-
-    Bandit.start_link(
-      plug: {__MODULE__, %{api_key: api_key}},
-      scheme: scheme,
-      port: port
-    )
+    {api_key, options} = Keyword.pop!(options, :api_key)
+    Bandit.start_link([plug: {__MODULE__, %{api_key: api_key}}] ++ options)
   end
 
   def child_spec(options) do
