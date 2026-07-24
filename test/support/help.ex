@@ -47,16 +47,21 @@ defmodule Help do
     options =
       options
       |> Keyword.put_new_lazy(:s3, fn ->
-        s3_credentials = s3_credentials(:minio)
-        s3_req = s3_req(s3_credentials)
-        ExUnit.Callbacks.on_exit(fn -> Req.delete!(s3_req, url: "s3://#{bucket}") end)
-        %{status: 200} = Req.put!(s3_req, url: "s3://#{bucket}")
-        Map.put(s3_credentials, :bucket, bucket)
+        credentials = s3_credentials(:minio)
+        :ok = create_bucket(credentials, bucket)
+        Map.put(credentials, :bucket, bucket)
       end)
       |> Keyword.put_new(:interval, to_timeout(second: 1))
       |> Keyword.put_new(:max_buffer_size, 1)
 
     ExUnit.Callbacks.start_supervised!({W3.Ingester, options})
+  end
+
+  def create_bucket(credentials, bucket) do
+    s3_req = s3_req(credentials)
+    ExUnit.Callbacks.on_exit(fn -> Req.delete!(s3_req, url: "s3://#{bucket}") end)
+    %{status: 200} = Req.put!(s3_req, url: "s3://#{bucket}")
+    :ok
   end
 
   def start_duck(s3_credentials) do

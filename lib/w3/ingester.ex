@@ -14,7 +14,7 @@ defmodule W3.Ingester do
 
   @impl GenServer
   def init(options) do
-    s3 = Keyword.fetch!(options, :s3)
+    s3 = options |> Keyword.fetch!(:s3) |> Map.new()
     interval = Keyword.get(options, :interval, to_timeout(second: 30))
     max_buffer_size = Keyword.get(options, :max_buffer_size, 10_000_000)
     timer = Process.send_after(self(), :flush, interval)
@@ -103,16 +103,13 @@ defmodule W3.Ingester do
     %{
       access_key_id: access_key_id,
       secret_access_key: secret_access_key,
-      region: region,
       endpoint_url: endpoint_url,
+      region: region,
       bucket: bucket
     } = s3
 
     id = "#{System.system_time(:microsecond)}-#{System.unique_integer([:positive])}"
-
-    key =
-      "raw/date=#{date}/hour=#{datetime.hour}/minute=#{datetime.minute}/#{id}.ndjson.zst"
-
+    key = "raw/date=#{date}/hour=#{datetime.hour}/minute=#{datetime.minute}/#{id}.ndjson.zst"
     metadata = %{bucket: bucket, key: key}
 
     :telemetry.span([:w3, :ingester, :upload], metadata, fn ->
@@ -120,9 +117,9 @@ defmodule W3.Ingester do
         Req.new(retry: :transient)
         |> ReqS3.attach(
           aws_sigv4: [
+            region: region,
             access_key_id: access_key_id,
-            secret_access_key: secret_access_key,
-            region: region
+            secret_access_key: secret_access_key
           ],
           aws_endpoint_url_s3: endpoint_url
         )
