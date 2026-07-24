@@ -91,4 +91,26 @@ defmodule Help do
     ExUnit.Callbacks.on_exit(fn -> :telemetry.detach(ref) end)
     ref
   end
+
+  def heartbeat(options \\ []) do
+    Map.merge(
+      %{
+        "branch" => "main",
+        "category" => "coding",
+        "cursorpos" => 1,
+        "dependencies" => nil,
+        "entity" => "/Users/q/Developer/copycat/w1/test/endpoint_test.exs",
+        "is_write" => nil,
+        "language" => "Elixir",
+        "lineno" => 1,
+        "lines" => 4,
+        "project" => "w1",
+        "time" => 1_653_576_917.486633,
+        "type" => "file",
+        "user_agent" =>
+          "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 vscode/1.68.0-insider vscode-wakatime/18.1.5"
+      },
+      Map.new(options, fn {key, value} -> {to_string(key), value} end)
+    )
+  end
 end
