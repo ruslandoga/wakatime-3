@@ -13,13 +13,20 @@ defmodule Help do
   def s3_req(credentials) do
     req = Req.new(retry: :transient)
 
+    %{
+      access_key_id: access_key_id,
+      secret_access_key: secret_access_key,
+      region: region,
+      endpoint_url: endpoint_url
+    } = credentials
+
     ReqS3.attach(req,
       aws_sigv4: [
-        access_key_id: credentials[:access_key_id],
-        secret_access_key: credentials[:secret_access_key],
-        region: credentials[:region]
+        access_key_id: access_key_id,
+        secret_access_key: secret_access_key,
+        region: region
       ],
-      aws_endpoint_url_s3: credentials[:endpoint_url]
+      aws_endpoint_url_s3: endpoint_url
     )
   end
 

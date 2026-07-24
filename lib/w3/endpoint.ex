@@ -24,6 +24,7 @@ defmodule W3.Endpoint do
   end
 
   plug :wakatime_auth
+  plug :put_secure_browser_headers
   plug :match
 
   plug Plug.Parsers,
@@ -33,12 +34,26 @@ defmodule W3.Endpoint do
 
   plug :dispatch
 
-  get "/hello/:name" do
-    send_resp(conn, 200, "hello #{name}")
+  post "/heartbeats" do
+    handle_heartbeats(conn)
+  end
+
+  post "/heartbeats/v1/users/current/heartbeats.bulk" do
+    handle_heartbeats(conn)
+  end
+
+  post "/users/current/heartbeats.bulk" do
+    handle_heartbeats(conn)
+  end
+
+  post "/plugins/errors" do
+    log_errors(conn)
   end
 
   match _ do
-    send_resp(conn, 404, "not found")
+    conn
+    |> put_resp_header("content-type", "text/plain")
+    |> send_resp(404, "not found")
   end
 
   @doc false
@@ -54,5 +69,51 @@ defmodule W3.Endpoint do
         |> resp(401, "Unauthorized")
         |> halt()
     end
+  end
+
+  @doc false
+  def put_secure_browser_headers(conn, _opts) do
+    headers = [
+      {"referrer-policy", "strict-origin-when-cross-origin"},
+      {"content-security-policy", "base-uri 'self'; frame-ancestors 'self';"},
+      {"x-content-type-options", "nosniff"},
+      {"x-permitted-cross-domain-policies", "none"}
+    ]
+
+    Enum.reduce(headers, conn, fn {key, value}, conn ->
+      put_resp_header(conn, key, value)
+    end)
+  end
+
+  @doc false
+  def handle_heartbeats(conn) do
+    %{"_json" => heartbeats} = conn.body_params
+
+    [machine_name] = get_req_header(conn, "x-machine-name")
+    IO.inspect(heartbeats: heartbeats, machine_name: machine_name)
+
+    json = JSON.encode_to_iodata!(%{"responses" => Enum.map(heartbeats, fn _ -> [nil, 201] end)})
+
+    conn
+    |> put_resp_header("content-type", "application/json; charset=utf-8")
+    |> send_resp(201, json)
+  end
+
+  @doc false
+  def log_errors(conn) do
+    require Logger
+
+    %{"logs" => logs} = conn.body_params
+
+    logs
+    |> String.split("\n", trim: true)
+    |> Enum.map(&JSON.decode!/1)
+    |> Enum.each(fn %{"level" => level} = log ->
+      level
+      |> String.to_existing_atom()
+      |> Logger.log(log)
+    end)
+
+    send_resp(conn, 201, [])
   end
 end
