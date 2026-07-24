@@ -59,6 +59,33 @@ defmodule Help do
     ExUnit.Callbacks.start_supervised!({W3.Ingester, options})
   end
 
+  def start_duck(s3_credentials) do
+    database = ExUnit.Callbacks.start_supervised!({Adbc.Database, driver: :duckdb})
+    duck = ExUnit.Callbacks.start_supervised!({Adbc.Connection, database: database})
+
+    %{"Success" => [true]} =
+      quack(duck, """
+      CREATE OR REPLACE SECRET secret (
+        TYPE s3,
+        PROVIDER config,
+        ENDPOINT '#{String.replace(s3_credentials.endpoint_url, "http://", "")}',
+        KEY_ID '#{s3_credentials.access_key_id}',
+        SECRET '#{s3_credentials.secret_access_key}',
+        REGION '#{s3_credentials.region}',
+        URL_STYLE path,
+        USE_SSL false
+      );
+      """)
+
+    duck
+  end
+
+  def quack(duck, sql, params \\ []) do
+    duck
+    |> Adbc.Connection.query!(sql, params)
+    |> Adbc.Result.to_map()
+  end
+
   def attach_telemetry(events) do
     ref = :telemetry_test.attach_event_handlers(self(), events)
     ExUnit.Callbacks.on_exit(fn -> :telemetry.detach(ref) end)
