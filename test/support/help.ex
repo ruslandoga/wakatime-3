@@ -11,18 +11,16 @@ defmodule Help do
   end
 
   def s3_req(credentials) do
-    req =
-      Req.new(
-        aws_sigv4: [
-          service: :s3,
-          access_key_id: credentials[:access_key_id],
-          secret_access_key: credentials[:secret_access_key],
-          region: credentials[:region]
-        ],
-        retry: :transient
-      )
+    req = Req.new(retry: :transient)
 
-    ReqS3.attach(req, aws_endpoint_url_s3: credentials[:endpoint_url])
+    ReqS3.attach(req,
+      aws_sigv4: [
+        access_key_id: credentials[:access_key_id],
+        secret_access_key: credentials[:secret_access_key],
+        region: credentials[:region]
+      ],
+      aws_endpoint_url_s3: credentials[:endpoint_url]
+    )
   end
 
   def start_endpoint(options) do
