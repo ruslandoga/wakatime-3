@@ -2,10 +2,14 @@ defmodule W3.EndpointTest do
   use ExUnit.Case, async: true
 
   setup do
+    bucket =
+      "w3-ingester-test-#{System.system_time(:second)}-#{System.unique_integer([:positive])}"
+
+    ingester = Help.start_ingester(bucket: bucket)
     api_key = Base.encode64(:crypto.strong_rand_bytes(32))
-    url = Help.start_endpoint(api_key: api_key)
+    url = Help.start_endpoint(api_key: api_key, ingester: ingester)
     req = Req.new(base_url: url, auth: {:basic, api_key})
-    {:ok, req: req}
+    {:ok, req: req, bucket: bucket}
   end
 
   describe "auth" do
@@ -65,7 +69,7 @@ defmodule W3.EndpointTest do
       {:ok, req: req}
     end
 
-    test "ingest", %{req: req} do
+    test "ingest", %{req: req, bucket: bucket} do
       body =
         JSON.encode_to_iodata!(%{
           "_json" => [
@@ -88,8 +92,50 @@ defmodule W3.EndpointTest do
           ]
         })
 
+      telemetry_ref = Help.attach_telemetry([[:w3, :ingester, :upload, :stop]])
+
       assert %{status: 201, body: %{"responses" => [[nil, 201]]}} =
                Req.post!(req, body: body)
+
+      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _measurements,
+                      %{key: key, bucket: ^bucket}}
+
+      s3_credentials = Help.s3_credentials(:minio)
+      s3_req = Help.s3_req(s3_credentials)
+
+      assert %{
+               status: 200,
+               headers: %{
+                 "content-encoding" => ["zstd"],
+                 "content-type" => ["application/x-ndjson"]
+               },
+               body: body
+             } = Req.get!(s3_req, url: "s3://#{bucket}/#{key}")
+
+      assert :zstd.decompress(body)
+             |> IO.iodata_to_binary()
+             |> String.split("\n", trim: true)
+             |> Enum.map(&JSON.decode!/1) == [
+               %{
+                 "branch" => "add-ingester",
+                 "category" => "coding",
+                 "cursorpos" => 1,
+                 "dependencies" => nil,
+                 "editor" => "vscode/1.68.0-insider",
+                 "entity" => "/Users/q/Developer/copycat/w1/test/endpoint_test.exs",
+                 "is_write" => false,
+                 "language" => "Elixir",
+                 "lineno" => 1,
+                 "lines" => 4,
+                 "machine_name" => "mac3.local",
+                 "operating_system" => "darwin-21.4.0-arm64",
+                 "project" => "w1",
+                 "time" => 1_653_576_917.486633,
+                 "type" => "file",
+                 "user_agent" =>
+                   "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 vscode/1.68.0-insider vscode-wakatime/18.1.5"
+               }
+             ]
     end
   end
 end

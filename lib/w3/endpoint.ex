@@ -4,7 +4,8 @@ defmodule W3.Endpoint do
 
   def start_link(options) do
     {api_key, options} = Keyword.pop!(options, :api_key)
-    Bandit.start_link([plug: {__MODULE__, %{api_key: api_key}}] ++ options)
+    {ingester, options} = Keyword.pop!(options, :ingester)
+    Bandit.start_link([plug: {__MODULE__, %{api_key: api_key, ingester: ingester}}] ++ options)
   end
 
   def child_spec(options) do
@@ -16,10 +17,14 @@ defmodule W3.Endpoint do
   end
 
   def call(conn, config) do
-    %{api_key: api_key} = config
+    %{
+      api_key: api_key,
+      ingester: ingester
+    } = config
 
     conn
     |> put_private(:api_key, api_key)
+    |> put_private(:ingester, ingester)
     |> super(_no_opts = [])
   end
 
@@ -90,7 +95,7 @@ defmodule W3.Endpoint do
     %{"_json" => heartbeats} = conn.body_params
 
     [machine_name] = get_req_header(conn, "x-machine-name")
-    IO.inspect(heartbeats: heartbeats, machine_name: machine_name)
+    W3.Ingester.insert_heartbeats!(conn.private.ingester, heartbeats, machine_name)
 
     json = JSON.encode_to_iodata!(%{"responses" => Enum.map(heartbeats, fn _ -> [nil, 201] end)})
 

@@ -36,8 +36,32 @@ defmodule Help do
       |> Keyword.put_new(:port, 0)
       |> Keyword.put_new(:startup_log, false)
 
-    pid = ExUnit.Callbacks.start_supervised!({W3.Endpoint, options})
-    {:ok, {_ip, port}} = ThousandIsland.listener_info(pid)
+    endpoint_pid = ExUnit.Callbacks.start_supervised!({W3.Endpoint, options})
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(endpoint_pid)
     "http://localhost:#{port}/"
+  end
+
+  def start_ingester(options) do
+    {bucket, options} = Keyword.pop!(options, :bucket)
+
+    options =
+      options
+      |> Keyword.put_new_lazy(:s3, fn ->
+        s3_credentials = s3_credentials(:minio)
+        s3_req = s3_req(s3_credentials)
+        ExUnit.Callbacks.on_exit(fn -> Req.delete!(s3_req, url: "s3://#{bucket}") end)
+        %{status: 200} = Req.put!(s3_req, url: "s3://#{bucket}")
+        Map.put(s3_credentials, :bucket, bucket)
+      end)
+      |> Keyword.put_new(:interval, to_timeout(second: 1))
+      |> Keyword.put_new(:max_buffer_size, 1)
+
+    ExUnit.Callbacks.start_supervised!({W3.Ingester, options})
+  end
+
+  def attach_telemetry(events) do
+    ref = :telemetry_test.attach_event_handlers(self(), events)
+    ExUnit.Callbacks.on_exit(fn -> :telemetry.detach(ref) end)
+    ref
   end
 end
