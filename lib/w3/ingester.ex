@@ -14,7 +14,7 @@ defmodule W3.Ingester do
 
   @impl GenServer
   def init(options) do
-    s3 = Keyword.fetch!(options, :s3)
+    s3 = options |> Keyword.fetch!(:s3) |> Map.new()
     interval = Keyword.get(options, :interval, to_timeout(second: 30))
     max_buffer_size = Keyword.get(options, :max_buffer_size, 10_000_000)
     timer = Process.send_after(self(), :flush, interval)
@@ -100,33 +100,29 @@ defmodule W3.Ingester do
     datetime = DateTime.utc_now(:second)
     date = DateTime.to_date(datetime)
 
-    bucket = Map.fetch!(s3, :bucket)
-    region = Map.get(s3, :region)
-    endpoint_url = Map.get(s3, :endpoint_url)
+    %{
+      access_key_id: access_key_id,
+      secret_access_key: secret_access_key,
+      endpoint_url: endpoint_url,
+      region: region,
+      bucket: bucket
+    } = s3
 
     id = "#{System.system_time(:microsecond)}-#{System.unique_integer([:positive])}"
-
-    key =
-      "raw/date=#{date}/hour=#{datetime.hour}/minute=#{datetime.minute}/#{id}.ndjson.zst"
-
+    key = "raw/date=#{date}/hour=#{datetime.hour}/minute=#{datetime.minute}/#{id}.ndjson.zst"
     metadata = %{bucket: bucket, key: key}
 
     :telemetry.span([:w3, :ingester, :upload], metadata, fn ->
-      req_options =
-        [
-          aws_sigv4:
-            [
-              region: region,
-              access_key_id: s3[:access_key_id],
-              secret_access_key: s3[:secret_access_key]
-            ]
-            |> Keyword.reject(fn {_key, value} -> is_nil(value) end)
-        ]
-        |> put_optional(:aws_endpoint_url_s3, endpoint_url)
-
       %{status: 200} =
         Req.new(retry: :transient)
-        |> ReqS3.attach(req_options)
+        |> ReqS3.attach(
+          aws_sigv4: [
+            region: region,
+            access_key_id: access_key_id,
+            secret_access_key: secret_access_key
+          ],
+          aws_endpoint_url_s3: endpoint_url
+        )
         |> Req.put!(
           headers: %{
             "content-encoding" => "zstd",
@@ -139,7 +135,4 @@ defmodule W3.Ingester do
       {:ok, metadata}
     end)
   end
-
-  defp put_optional(options, _key, nil), do: options
-  defp put_optional(options, key, value), do: Keyword.put(options, key, value)
 end
