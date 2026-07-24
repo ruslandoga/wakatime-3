@@ -29,7 +29,6 @@ defmodule Help do
     options =
       options
       |> Keyword.put_new(:port, 0)
-      |> Keyword.put_new(:api_key, "test_api_key")
       |> Keyword.put_new(:startup_log, false)
 
     pid = ExUnit.Callbacks.start_supervised!({W3.Endpoint, options})
