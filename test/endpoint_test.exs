@@ -73,22 +73,7 @@ defmodule W3.EndpointTest do
       body =
         JSON.encode_to_iodata!(%{
           "_json" => [
-            %{
-              "branch" => "add-ingester",
-              "category" => "coding",
-              "cursorpos" => 1,
-              "dependencies" => nil,
-              "entity" => "/Users/q/Developer/copycat/w1/test/endpoint_test.exs",
-              "is_write" => nil,
-              "language" => "Elixir",
-              "lineno" => 1,
-              "lines" => 4,
-              "project" => "w1",
-              "time" => 1_653_576_917.486633,
-              "type" => "file",
-              "user_agent" =>
-                "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 vscode/1.68.0-insider vscode-wakatime/18.1.5"
-            }
+            Help.heartbeat(branch: "add-ingester")
           ]
         })
 
@@ -122,6 +107,48 @@ defmodule W3.EndpointTest do
                "user_agent" => [
                  "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 vscode/1.68.0-insider vscode-wakatime/18.1.5"
                ]
+             }
+    end
+
+    test "ingest does not overwrite multiple flushes in the same minute", %{
+      req: req,
+      bucket: bucket
+    } do
+      telemetry_ref = Help.attach_telemetry([[:w3, :ingester, :upload, :stop]])
+
+      body1 =
+        JSON.encode_to_iodata!(%{
+          "_json" => [
+            Help.heartbeat(entity: "first.ex", project: "w1", time: 1_653_576_917.486633)
+          ]
+        })
+
+      body2 =
+        JSON.encode_to_iodata!(%{
+          "_json" => [
+            Help.heartbeat(entity: "second.ex", project: "w2", time: 1_653_576_918.486633)
+          ]
+        })
+
+      assert %{status: 201} = Req.post!(req, body: body1)
+      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _, %{bucket: ^bucket}}
+
+      assert %{status: 201} = Req.post!(req, body: body2)
+      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _, %{bucket: ^bucket}}
+
+      duck = Help.start_duck(Help.s3_credentials(:minio))
+
+      assert Help.quack(
+               duck,
+               """
+               select project, entity, time
+               from 's3://#{bucket}/**/*.ndjson.zst'
+               order by time
+               """
+             ) == %{
+               "entity" => ["first.ex", "second.ex"],
+               "project" => ["w1", "w2"],
+               "time" => [1_653_576_917.486633, 1_653_576_918.486633]
              }
     end
   end

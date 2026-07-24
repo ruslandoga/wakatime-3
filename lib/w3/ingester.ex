@@ -108,7 +108,11 @@ defmodule W3.Ingester do
       bucket: bucket
     } = s3
 
-    key = "/raw/date=#{date}/hour=#{datetime.hour}/minute=#{datetime.minute}/raw.ndjson.zst"
+    id = "#{System.system_time(:microsecond)}-#{System.unique_integer([:positive])}"
+
+    key =
+      "raw/date=#{date}/hour=#{datetime.hour}/minute=#{datetime.minute}/#{id}.ndjson.zst"
+
     metadata = %{bucket: bucket, key: key}
 
     :telemetry.span([:w3, :ingester, :upload], metadata, fn ->
