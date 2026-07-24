@@ -100,13 +100,9 @@ defmodule W3.Ingester do
     datetime = DateTime.utc_now(:second)
     date = DateTime.to_date(datetime)
 
-    %{
-      access_key_id: access_key_id,
-      secret_access_key: secret_access_key,
-      region: region,
-      endpoint_url: endpoint_url,
-      bucket: bucket
-    } = s3
+    bucket = Map.fetch!(s3, :bucket)
+    region = Map.get(s3, :region)
+    endpoint_url = Map.get(s3, :endpoint_url)
 
     id = "#{System.system_time(:microsecond)}-#{System.unique_integer([:positive])}"
 
@@ -116,16 +112,21 @@ defmodule W3.Ingester do
     metadata = %{bucket: bucket, key: key}
 
     :telemetry.span([:w3, :ingester, :upload], metadata, fn ->
+      req_options =
+        [
+          aws_sigv4:
+            [
+              region: region,
+              access_key_id: s3[:access_key_id],
+              secret_access_key: s3[:secret_access_key]
+            ]
+            |> Keyword.reject(fn {_key, value} -> is_nil(value) end)
+        ]
+        |> put_optional(:aws_endpoint_url_s3, endpoint_url)
+
       %{status: 200} =
         Req.new(retry: :transient)
-        |> ReqS3.attach(
-          aws_sigv4: [
-            access_key_id: access_key_id,
-            secret_access_key: secret_access_key,
-            region: region
-          ],
-          aws_endpoint_url_s3: endpoint_url
-        )
+        |> ReqS3.attach(req_options)
         |> Req.put!(
           headers: %{
             "content-encoding" => "zstd",
@@ -138,4 +139,7 @@ defmodule W3.Ingester do
       {:ok, metadata}
     end)
   end
+
+  defp put_optional(options, _key, nil), do: options
+  defp put_optional(options, key, value), do: Keyword.put(options, key, value)
 end
