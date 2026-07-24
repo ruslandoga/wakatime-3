@@ -10,10 +10,10 @@ defmodule W3.ApplicationTest do
 
     assert Keyword.fetch!(config, :s3) == [
              bucket: "w3-test",
-             region: "us-east-1",
-             endpoint_url: "s3.amazonaws.com",
-             access_key_id: "minioadmin",
-             secret_access_key: "minioadmin"
+             region: System.get_env("AWS_REGION", "us-east-1"),
+             endpoint_url: System.get_env("AWS_ENDPOINT_URL_S3", "s3.amazonaws.com"),
+             access_key_id: System.get_env("AWS_ACCESS_KEY_ID", "minioadmin"),
+             secret_access_key: System.get_env("AWS_SECRET_ACCESS_KEY", "minioadmin")
            ]
   end
 
