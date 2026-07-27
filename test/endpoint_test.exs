@@ -82,12 +82,15 @@ defmodule W3.EndpointTest do
       assert %{status: 201, body: %{"responses" => [[nil, 201]]}} =
                Req.post!(req, body: body)
 
-      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _, %{bucket: ^bucket}}
+      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _,
+                      %{bucket: ^bucket, key: key}}
+
+      assert key =~ ~r{\Araw/\d+-\d+\.ndjson\.zst\z}
       duck = Help.start_duck(Help.s3_credentials(:minio))
 
       assert Help.quack(
                duck,
-               "select * exclude(date, minute, hour) from 's3://#{bucket}/**/*.ndjson.zst'"
+               "select * from 's3://#{bucket}/raw/*.ndjson.zst'"
              ) == %{
                "branch" => ["add-ingester"],
                "category" => ["coding"],
@@ -142,7 +145,7 @@ defmodule W3.EndpointTest do
                duck,
                """
                select project, entity, time
-               from 's3://#{bucket}/**/*.ndjson.zst'
+               from 's3://#{bucket}/raw/*.ndjson.zst'
                order by time
                """
              ) == %{

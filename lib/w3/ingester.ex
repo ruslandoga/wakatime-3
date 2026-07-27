@@ -97,9 +97,6 @@ defmodule W3.Ingester do
   defp add_to_buffer(buffer, data), do: [buffer | data]
 
   defp flush(s3, data) do
-    datetime = DateTime.utc_now(:second)
-    date = DateTime.to_date(datetime)
-
     %{
       access_key_id: access_key_id,
       secret_access_key: secret_access_key,
@@ -109,7 +106,7 @@ defmodule W3.Ingester do
     } = s3
 
     id = "#{System.system_time(:microsecond)}-#{System.unique_integer([:positive])}"
-    key = "raw/date=#{date}/hour=#{datetime.hour}/minute=#{datetime.minute}/#{id}.ndjson.zst"
+    key = "raw/#{id}.ndjson.zst"
     metadata = %{bucket: bucket, key: key}
 
     :telemetry.span([:w3, :ingester, :upload], metadata, fn ->
