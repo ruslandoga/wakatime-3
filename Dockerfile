@@ -1,8 +1,10 @@
-FROM hexpm/elixir:1.20.3-erlang-29.0.5-debian-bookworm-20260824-slim AS build
+FROM hexpm/elixir:1.20.3-erlang-29.0.5-alpine-3.24.1 AS build
 
 WORKDIR /app
 
-RUN mix local.hex --force && mix local.rebar --force
+RUN apk add --no-cache git \
+    && mix local.hex --force \
+    && mix local.rebar --force
 
 ENV MIX_ENV=prod
 
@@ -14,18 +16,17 @@ COPY config/runtime.exs config/
 COPY lib lib
 RUN mix compile && mix release
 
-FROM debian:bookworm-20260824-slim AS app
+FROM alpine:3.24.1 AS app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apk add --no-cache \
         ca-certificates \
-        libgcc-s1 \
-        libncurses6 \
-        libsctp1 \
-        libstdc++6 \
+        libgcc \
+        liblksctp \
+        libstdc++ \
+        ncurses-libs \
         openssl \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --system --uid 999 --home-dir /app w3
+    && addgroup --system w3 \
+    && adduser --system --disabled-password --uid 999 --ingroup w3 --home /app w3
 
 WORKDIR /app
 
