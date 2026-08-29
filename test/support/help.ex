@@ -41,20 +41,10 @@ defmodule Help do
     "http://localhost:#{port}/"
   end
 
-  def start_ingester(options) do
-    {bucket, options} = Keyword.pop!(options, :bucket)
-
-    options =
-      options
-      |> Keyword.put_new_lazy(:s3, fn ->
-        credentials = s3_credentials(:minio)
-        :ok = create_bucket(credentials, bucket)
-        Map.put(credentials, :bucket, bucket)
-      end)
-      |> Keyword.put_new(:interval, to_timeout(second: 1))
-      |> Keyword.put_new(:max_buffer_size, 1)
-
-    ExUnit.Callbacks.start_supervised!({W3.Ingester, options})
+  def create_s3(bucket) do
+    credentials = s3_credentials(:minio)
+    :ok = create_bucket(credentials, bucket)
+    Map.put(credentials, :bucket, bucket)
   end
 
   def create_bucket(credentials, bucket) do

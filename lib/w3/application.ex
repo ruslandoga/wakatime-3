@@ -8,12 +8,10 @@ defmodule W3.Application do
 
     api_key = Keyword.fetch!(config, :api_key)
     http = Keyword.fetch!(config, :http)
-    ingester = Keyword.fetch!(config, :ingester)
     s3 = Keyword.fetch!(config, :s3)
 
     children = [
-      {W3.Ingester, Keyword.merge(ingester, s3: s3, name: W3.Ingester)},
-      {W3.Endpoint, Keyword.merge(http, api_key: api_key, ingester: W3.Ingester)}
+      {W3.Endpoint, Keyword.merge(http, api_key: api_key, s3: s3)}
     ]
 
     opts = [strategy: :one_for_one, name: W3.Supervisor]

@@ -1,13 +1,15 @@
 defmodule W3.EndpointTest do
   use ExUnit.Case, async: true
 
+  @moduletag :minio
+
   setup do
     bucket =
       "w3-ingester-test-#{System.system_time(:second)}-#{System.unique_integer([:positive])}"
 
-    ingester = Help.start_ingester(bucket: bucket)
-    api_key = Base.encode64(:crypto.strong_rand_bytes(32))
-    url = Help.start_endpoint(api_key: api_key, ingester: ingester)
+    s3 = Help.create_s3(bucket)
+    api_key = "406fe41f-6d69-4183-a4cc-121e0c524c2b"
+    url = Help.start_endpoint(api_key: api_key, s3: s3)
     req = Req.new(base_url: url, auth: {:basic, api_key})
     {:ok, req: req, bucket: bucket}
   end
@@ -58,9 +60,10 @@ defmodule W3.EndpointTest do
     setup %{req: req} do
       req =
         Req.merge(req,
-          url: "/heartbeats",
+          url: "/users/current/heartbeats.bulk",
           headers: %{
             "x-machine-name" => "mac3.local",
+            "timezone" => "Europe/Moscow",
             "content-type" => "application/json",
             "accept" => "application/json"
           }
@@ -70,12 +73,7 @@ defmodule W3.EndpointTest do
     end
 
     test "ingest", %{req: req, bucket: bucket} do
-      body =
-        JSON.encode_to_iodata!(%{
-          "_json" => [
-            Help.heartbeat(branch: "add-ingester")
-          ]
-        })
+      body = JSON.encode_to_iodata!([Help.heartbeat(branch: "add-ingester")])
 
       telemetry_ref = Help.attach_telemetry([[:w3, :ingester, :upload, :stop]])
 
@@ -85,7 +83,7 @@ defmodule W3.EndpointTest do
       assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _,
                       %{bucket: ^bucket, key: key}}
 
-      assert key =~ ~r{\Araw/\d+-\d+\.ndjson\.zst\z}
+      assert key =~ ~r|\Araw/[0-9a-f]{64}\.ndjson\.zst\z|
       duck = Help.start_duck(Help.s3_credentials(:minio))
 
       assert Help.quack(
@@ -96,16 +94,15 @@ defmodule W3.EndpointTest do
                "category" => ["coding"],
                "cursorpos" => [1],
                "dependencies" => [nil],
-               "editor" => ["vscode/1.68.0-insider"],
                "entity" => ["/Users/q/Developer/copycat/w1/test/endpoint_test.exs"],
-               "is_write" => [false],
+               "is_write" => [nil],
                "language" => ["Elixir"],
                "lineno" => [1],
                "lines" => [4],
                "machine_name" => ["mac3.local"],
-               "operating_system" => ["darwin-21.4.0-arm64"],
                "project" => ["w1"],
                "time" => [1_653_576_917.486633],
+               "timezone" => ["Europe/Moscow"],
                "type" => ["file"],
                "user_agent" => [
                  "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 vscode/1.68.0-insider vscode-wakatime/18.1.5"
@@ -120,18 +117,14 @@ defmodule W3.EndpointTest do
       telemetry_ref = Help.attach_telemetry([[:w3, :ingester, :upload, :stop]])
 
       body1 =
-        JSON.encode_to_iodata!(%{
-          "_json" => [
-            Help.heartbeat(entity: "first.ex", project: "w1", time: 1_653_576_917.486633)
-          ]
-        })
+        JSON.encode_to_iodata!([
+          Help.heartbeat(entity: "first.ex", project: "w1", time: 1_653_576_917.486633)
+        ])
 
       body2 =
-        JSON.encode_to_iodata!(%{
-          "_json" => [
-            Help.heartbeat(entity: "second.ex", project: "w2", time: 1_653_576_918.486633)
-          ]
-        })
+        JSON.encode_to_iodata!([
+          Help.heartbeat(entity: "second.ex", project: "w2", time: 1_653_576_918.486633)
+        ])
 
       assert %{status: 201} = Req.post!(req, body: body1)
       assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _, %{bucket: ^bucket}}
@@ -153,6 +146,13 @@ defmodule W3.EndpointTest do
                "project" => ["w1", "w2"],
                "time" => [1_653_576_917.486633, 1_653_576_918.486633]
              }
+    end
+
+    test "returns 503 when S3 rejects the upload", %{req: req, bucket: bucket} do
+      Req.delete!(Help.s3_req(Help.s3_credentials(:minio)), url: "s3://#{bucket}")
+
+      assert %{status: 503, body: "service unavailable"} =
+               Req.post!(req, body: JSON.encode_to_iodata!([Help.heartbeat()]))
     end
   end
 end
