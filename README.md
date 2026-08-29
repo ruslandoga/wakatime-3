@@ -32,7 +32,8 @@ docker run --detach \
   --name w3 \
   --restart always \
   --pull always \
-  --publish 4000:4000 \
+  --publish 6767:6767 \
+  -e HTTP_PORT=6767 \
   -e API_KEY=your-wakatime-shaped-api-key \
   -e AWS_S3_BUCKET=w3 \
   -e AWS_REGION=auto \
@@ -46,7 +47,7 @@ Point WakaTime at the service in `~/.wakatime.cfg`:
 
 ```ini
 [settings]
-api_url = http://127.0.0.1:4000
+api_url = http://127.0.0.1:6767
 api_key = your-wakatime-shaped-api-key
 heartbeat_rate_limit_seconds = 300
 ```
