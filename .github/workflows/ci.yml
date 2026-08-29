@@ -33,7 +33,7 @@ jobs:
             test-${{ steps.beam.outputs.elixir-version }}-${{ github.head_ref || github.ref }}-
             test-${{ steps.beam.outputs.elixir-version }}-refs/heads/master-
 
-      - run: mix deps.get --only $MIX_ENV
+      - run: mix deps.get --only "$MIX_ENV"
       - run: mix deps.get --check-locked
       - run: mix deps.unlock --check-unused
       - run: mix hex.audit
@@ -58,3 +58,29 @@ jobs:
             plts-${{ steps.beam.outputs.elixir-version }}-refs/heads/master
 
       - run: mix dialyzer --format github
+
+  image:
+    needs: test
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    with:
+      output: image
+      push: ${{ github.event_name == 'push' }}
+      platforms: linux/amd64,linux/arm64
+      cache: true
+      cache-mode: max
+      set-meta-labels: true
+      meta-images: ghcr.io/${{ github.repository }}
+      meta-tags: |
+        type=ref,event=branch
+        type=ref,event=pr
+        type=raw,value=latest,enable={{is_default_branch}}
+        type=sha
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}

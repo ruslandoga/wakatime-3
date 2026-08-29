@@ -18,20 +18,18 @@ events.
 
 ## Run
 
-Set the HTTP and object-store configuration, then run `mix run --no-halt`:
+The published image supports `linux/amd64` and `linux/arm64`:
 
 ```sh
-export API_KEY=your-wakatime-shaped-api-key
-export AWS_S3_BUCKET=w3
-export AWS_REGION=auto
-export AWS_ENDPOINT_URL_S3=https://ACCOUNT_ID.r2.cloudflarestorage.com
-export AWS_ACCESS_KEY_ID=your-r2-access-key-id
-export AWS_SECRET_ACCESS_KEY=your-r2-secret-access-key
-
-mix run --no-halt
+docker run --rm -p 4000:4000 \
+  -e API_KEY=your-wakatime-shaped-api-key \
+  -e AWS_S3_BUCKET=w3 \
+  -e AWS_REGION=auto \
+  -e AWS_ENDPOINT_URL_S3=https://ACCOUNT_ID.r2.cloudflarestorage.com \
+  -e AWS_ACCESS_KEY_ID=your-r2-access-key-id \
+  -e AWS_SECRET_ACCESS_KEY=your-r2-secret-access-key \
+  ghcr.io/ruslandoga/wakatime-3:latest
 ```
-
-`HTTP_PORT` defaults to `4000`.
 
 Point WakaTime at the service in `~/.wakatime.cfg`:
 
