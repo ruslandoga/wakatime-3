@@ -1,6 +1,8 @@
 defmodule W3.CompactorTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias W3.Compactor
 
   @user_agent "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 " <>
@@ -60,8 +62,25 @@ defmodule W3.CompactorTest do
     put_raw!(request, bucket, first_raw_key, [existing, new])
     put_raw!(request, bucket, second_raw_key, [new, variant])
 
-    compactor = start_supervised!({Compactor, store(credentials, bucket)})
-    _ = :sys.get_state(compactor)
+    telemetry_ref =
+      Help.attach_telemetry([
+        [:w3, :compactor, :run, :start],
+        [:w3, :compactor, :run, :stop]
+      ])
+
+    log = capture_log(fn -> assert :ok = Compactor.run!(store(credentials, bucket)) end)
+
+    assert_receive {[:w3, :compactor, :run, :start], ^telemetry_ref,
+                    %{monotonic_time: monotonic_time, system_time: system_time},
+                    %{bucket: ^bucket}}
+
+    assert_receive {[:w3, :compactor, :run, :stop], ^telemetry_ref, %{duration: duration},
+                    %{bucket: ^bucket}}
+
+    assert is_integer(monotonic_time)
+    assert is_integer(system_time)
+    assert is_integer(duration)
+    assert log =~ "heartbeat compaction complete"
 
     assert object_status(request, bucket, first_raw_key) == 404
     assert object_status(request, bucket, second_raw_key) == 404
@@ -128,10 +147,26 @@ defmodule W3.CompactorTest do
 
     on_exit(fn -> Req.delete(request, url: "s3://#{bucket}/#{raw_key}") end)
 
-    compactor = start_supervised!({Compactor, store(credentials, bucket)})
-    _ = :sys.get_state(compactor)
+    telemetry_ref = Help.attach_telemetry([[:w3, :compactor, :run, :exception]])
 
-    assert Process.alive?(compactor)
+    log =
+      capture_log(fn ->
+        assert_raise DuckNIF.Error, fn ->
+          Compactor.run!(store(credentials, bucket))
+        end
+      end)
+
+    assert_receive {[:w3, :compactor, :run, :exception], ^telemetry_ref, %{duration: duration},
+                    %{
+                      bucket: ^bucket,
+                      kind: :error,
+                      reason: %DuckNIF.Error{},
+                      stacktrace: stacktrace
+                    }}
+
+    assert is_integer(duration)
+    assert is_list(stacktrace)
+    assert log =~ "heartbeat compaction failed"
     assert object_status(request, bucket, raw_key) == 200
 
     refute File.exists?(Path.join(System.get_env("DATA_PATH", System.tmp_dir!()), "w3-compactor"))

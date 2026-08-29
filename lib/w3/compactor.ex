@@ -10,13 +10,13 @@ defmodule W3.Compactor do
 
   require Logger
 
-  def start_link(s3) do
-    GenServer.start_link(__MODULE__, s3, name: __MODULE__)
+  def start_link({s3, options}) do
+    GenServer.start_link(__MODULE__, {s3, options}, name: __MODULE__)
   end
 
   @impl true
-  def init(s3) do
-    send(self(), :compact)
+  def init({s3, options}) do
+    Process.send_after(self(), :compact, Keyword.get(options, :initial_delay, 0))
     {:ok, s3}
   end
 
@@ -24,9 +24,8 @@ defmodule W3.Compactor do
   def handle_info(:compact, s3) do
     try do
       run!(s3)
-      Logger.info("heartbeat compaction complete")
     rescue
-      exception -> Logger.error("heartbeat compaction failed: #{Exception.message(exception)}")
+      _exception -> :ok
     after
       Process.send_after(self(), :compact, :timer.hours(24))
     end
@@ -35,7 +34,28 @@ defmodule W3.Compactor do
   end
 
   def run!(s3) do
-    s3 = store!(s3)
+    s3 = Map.new(s3)
+    metadata = %{bucket: Map.get(s3, :bucket)}
+
+    :telemetry.span([:w3, :compactor, :run], metadata, fn ->
+      store!(s3)
+      {compact_snapshot!(s3), metadata}
+    end)
+  end
+
+  def handle_event([:w3, :compactor, :run, :stop], _measurements, metadata, _config) do
+    Logger.info("heartbeat compaction complete", bucket: metadata.bucket)
+  end
+
+  def handle_event([:w3, :compactor, :run, :exception], _measurements, metadata, _config) do
+    Logger.error(
+      "heartbeat compaction failed:\n" <>
+        Exception.format(metadata.kind, metadata.reason, metadata.stacktrace),
+      bucket: metadata.bucket
+    )
+  end
+
+  defp compact_snapshot!(s3) do
     request = request(s3)
     directory = Path.join(System.get_env("DATA_PATH", System.tmp_dir!()), "w3-compactor")
     File.rm_rf!(directory)
@@ -305,8 +325,6 @@ defmodule W3.Compactor do
   defp success!(%{status: status}), do: raise("S3 request failed with status #{status}")
 
   defp store!(store) do
-    store = Map.new(store)
-
     for key <- [:bucket, :region, :endpoint_url, :access_key_id, :secret_access_key] do
       case Map.fetch(store, key) do
         {:ok, value} when is_binary(value) and value != "" -> :ok

@@ -65,8 +65,10 @@ No manifest, persistent state, dated generation, or lifecycle rule is needed.
 
 For now the compactor uses the application's existing read/write S3 credentials and bucket. Keep the
 bucket private: do not enable `r2.dev`, a public custom domain, or browser CORS. A supervised
-`W3.Compactor` process runs once when the application starts and then 24 hours after each completed
-run.
+`W3.Compactor` process always starts with the application and immediately begins its first run. Each
+attempt schedules the next one 24 hours later. Runs emit telemetry under
+`[:w3, :compactor, :run]`; the application attaches the success and failure logger as a telemetry
+handler.
 
 Set `DATA_PATH` on the running container to choose the parent directory for temporary compaction
 files. It defaults to the system temporary directory; only its `w3-compactor` child is cleared.

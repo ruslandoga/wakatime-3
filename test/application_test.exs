@@ -5,7 +5,7 @@ defmodule W3.ApplicationTest do
     config = W3.config()
 
     assert Keyword.fetch!(config, :api_key) == "406fe41f-6d69-4183-a4cc-121e0c524c2b"
-    refute Keyword.fetch!(config, :compactor)
+    assert Keyword.fetch!(config, :compactor) == [initial_delay: :timer.hours(24)]
     assert Keyword.fetch!(config, :http) == [scheme: :http, port: 0]
     refute Keyword.has_key?(config, :ingester)
 
@@ -18,11 +18,19 @@ defmodule W3.ApplicationTest do
            ]
   end
 
-  test "starts endpoint from runtime config" do
-    assert [{W3.Endpoint, endpoint, :supervisor, _}] =
-             Supervisor.which_children(W3.Supervisor)
+  test "starts endpoint and compactor from runtime config" do
+    children = Supervisor.which_children(W3.Supervisor)
+
+    assert {W3.Endpoint, endpoint, :supervisor, _} = List.keyfind(children, W3.Endpoint, 0)
+    assert {W3.Compactor, compactor, :worker, _} = List.keyfind(children, W3.Compactor, 0)
 
     assert {:ok, {_ip, port}} = ThousandIsland.listener_info(endpoint)
     assert is_integer(port)
+    assert Process.alive?(compactor)
+
+    assert Enum.any?(
+             :telemetry.list_handlers([:w3, :compactor, :run, :stop]),
+             &(&1.id == {W3.Compactor, :logger})
+           )
   end
 end
