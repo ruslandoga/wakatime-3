@@ -2,6 +2,7 @@ import Config
 
 config :w3,
   api_key: "406fe41f-6d69-4183-a4cc-121e0c524c2b",
+  compactor: false,
   http: [
     port: 0
   ],

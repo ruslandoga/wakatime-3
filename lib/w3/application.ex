@@ -10,9 +10,14 @@ defmodule W3.Application do
     http = Keyword.fetch!(config, :http)
     s3 = Keyword.fetch!(config, :s3)
 
-    children = [
-      {W3.Endpoint, Keyword.merge(http, api_key: api_key, s3: s3)}
-    ]
+    children = [{W3.Endpoint, Keyword.merge(http, api_key: api_key, s3: s3)}]
+
+    children =
+      if Keyword.get(config, :compactor, true) do
+        children ++ [{W3.Compactor, s3}]
+      else
+        children
+      end
 
     opts = [strategy: :one_for_one, name: W3.Supervisor]
     Supervisor.start_link(children, opts)

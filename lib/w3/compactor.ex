@@ -1,4 +1,6 @@
 defmodule W3.Compactor do
+  use GenServer
+
   @moduledoc """
   Merges a snapshot of raw heartbeats into the annual Parquet files.
 
@@ -6,13 +8,36 @@ defmodule W3.Compactor do
   its database and connection exist only while the local merge is running.
   """
 
-  def run!, do: run!(Application.fetch_env!(:w3, :s3))
-  def run!(s3), do: run!(s3, DuckNIF)
+  require Logger
 
-  def run!(s3, adapter) do
+  def start_link(s3) do
+    GenServer.start_link(__MODULE__, s3, name: __MODULE__)
+  end
+
+  @impl true
+  def init(s3) do
+    send(self(), :compact)
+    {:ok, s3}
+  end
+
+  @impl true
+  def handle_info(:compact, s3) do
+    try do
+      run!(s3)
+      Logger.info("heartbeat compaction complete")
+    rescue
+      exception -> Logger.error("heartbeat compaction failed: #{Exception.message(exception)}")
+    after
+      Process.send_after(self(), :compact, :timer.hours(24))
+    end
+
+    {:noreply, s3}
+  end
+
+  def run!(s3) do
     s3 = store!(s3)
     request = request(s3)
-    directory = Path.join(System.tmp_dir!(), "w3-compactor")
+    directory = Path.join(System.get_env("DATA_PATH", System.tmp_dir!()), "w3-compactor")
     File.rm_rf!(directory)
 
     raw_keys =
@@ -23,11 +48,11 @@ defmodule W3.Compactor do
     if raw_keys == [] do
       :ok
     else
-      compact!(request, s3.bucket, raw_keys, directory, adapter)
+      compact!(request, s3.bucket, raw_keys, directory)
     end
   end
 
-  defp compact!(request, bucket, raw_keys, directory, adapter) do
+  defp compact!(request, bucket, raw_keys, directory) do
     raw_directory = Path.join(directory, "raw")
     canonical_directory = Path.join(directory, "canonical")
     output_directory = Path.join(directory, "output")
@@ -40,10 +65,10 @@ defmodule W3.Compactor do
       canonical_keys =
         request
         |> list_keys(bucket, "v1/year=")
-        |> Enum.filter(&Regex.match?(~r|\Av1/year=\d{4}/heartbeats\.parquet\z|, &1))
+        |> Enum.filter(&String.ends_with?(&1, "/heartbeats.parquet"))
 
       download!(request, bucket, canonical_keys, canonical_directory, ".parquet")
-      query!(sql(raw_directory, canonical_directory, output_directory, canonical_keys), adapter)
+      query!(sql(raw_directory, canonical_directory, output_directory, canonical_keys))
 
       outputs = Path.wildcard(Path.join(output_directory, "year=*/*.parquet"))
 
@@ -59,25 +84,25 @@ defmodule W3.Compactor do
     end
   end
 
-  defp query!(sql, adapter) do
-    database = adapter.open()
+  defp query!(sql) do
+    database = DuckNIF.open()
 
     try do
-      connection = adapter.connect(database)
+      connection = DuckNIF.connect(database)
 
       try do
-        result = adapter.query_dirty_io(connection, sql)
+        result = DuckNIF.query_dirty_io(connection, sql)
 
         try do
           :ok
         after
-          :ok = adapter.destroy_result(result)
+          :ok = DuckNIF.destroy_result(result)
         end
       after
-        :ok = adapter.disconnect(connection)
+        :ok = DuckNIF.disconnect(connection)
       end
     after
-      :ok = adapter.close(database)
+      :ok = DuckNIF.close(database)
     end
   end
 
@@ -259,7 +284,7 @@ defmodule W3.Compactor do
   end
 
   defp upload!(request, bucket, path) do
-    year = output_year!(path)
+    "year=" <> year = path |> Path.dirname() |> Path.basename()
 
     Req.put!(request,
       url: "s3://#{bucket}/v1/year=#{year}/heartbeats.parquet",
@@ -269,11 +294,6 @@ defmodule W3.Compactor do
     |> success!()
 
     :ok
-  end
-
-  defp output_year!(path) do
-    [_, year] = Regex.run(~r|/year=(\d{4})/[^/]+\.parquet\z|, path)
-    year
   end
 
   defp delete!(request, bucket, key) do

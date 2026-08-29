@@ -64,15 +64,15 @@ for the next run; a failed or interrupted run safely retries because the merge d
 No manifest, persistent state, dated generation, or lifecycle rule is needed.
 
 For now the compactor uses the application's existing read/write S3 credentials and bucket. Keep the
-bucket private: do not enable `r2.dev`, a public custom domain, or browser CORS. Invoke it in the
-running release, for example from the host scheduler:
+bucket private: do not enable `r2.dev`, a public custom domain, or browser CORS. A supervised
+`W3.Compactor` process runs once when the application starts and then 24 hours after each completed
+run.
 
-```sh
-docker exec CONTAINER /app/bin/w3 rpc 'W3.Compactor.run!()'
-```
+Set `DATA_PATH` on the running container to choose the parent directory for temporary compaction
+files. It defaults to the system temporary directory; only its `w3-compactor` child is cleared.
 
-Start with one local run per day rather than one run per heartbeat upload. The database and connection
-are created and closed on every non-empty run, including failures.
+The database and connection are created and closed on every non-empty run, including failures; the
+GenServer retains no DuckDB handle between runs.
 
 Canonical files use UTC `TIMESTAMPTZ`, Parquet V2 data pages, Zstandard compression, and 122,880-row
 groups. Routine analytics query only this dataset—not raw NDJSON:

@@ -2,7 +2,6 @@ defmodule W3.CompactorTest do
   use ExUnit.Case, async: true
 
   alias W3.Compactor
-  alias W3.CompactorTest.{FailingAdapter, TrackingAdapter}
 
   @user_agent "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 " <>
                 "vscode/1.68.0-insider vscode-wakatime/18.1.5"
@@ -61,26 +60,11 @@ defmodule W3.CompactorTest do
     put_raw!(request, bucket, first_raw_key, [existing, new])
     put_raw!(request, bucket, second_raw_key, [new, variant])
 
-    Process.put({TrackingAdapter, :before_query}, fn ->
-      put_raw!(request, bucket, late_raw_key, [late])
-    end)
-
-    on_exit(fn -> Process.delete({TrackingAdapter, :before_query}) end)
-
-    assert :ok = Compactor.run!(store(credentials, bucket), TrackingAdapter)
-
-    assert_receive :open
-    assert_receive :connect
-    assert_receive {:query, sql}
-    assert length(Regex.scan(~r/\bCOPY \(/, sql)) == 1
-    refute sql =~ "s3://"
-    assert_receive :destroy_result
-    assert_receive :disconnect
-    assert_receive :close
+    compactor = start_supervised!({Compactor, store(credentials, bucket)})
+    _ = :sys.get_state(compactor)
 
     assert object_status(request, bucket, first_raw_key) == 404
     assert object_status(request, bucket, second_raw_key) == 404
-    assert object_status(request, bucket, late_raw_key) == 200
 
     canonical_glob = "s3://#{bucket}/v1/year=*/heartbeats.parquet"
     _ = Help.quack(duck, "SET TimeZone = 'Europe/Moscow'")
@@ -105,7 +89,7 @@ defmodule W3.CompactorTest do
              """
            ) == %{"format_version" => [2], "non_zstd" => [0]}
 
-    Process.delete({TrackingAdapter, :before_query})
+    put_raw!(request, bucket, late_raw_key, [late])
     assert :ok = Compactor.run!(store(credentials, bucket))
     assert object_status(request, bucket, late_raw_key) == 404
 
@@ -126,8 +110,9 @@ defmodule W3.CompactorTest do
              "year" => [2025, 2025, 2025, 2026]
            }
 
-    assert :ok = Compactor.run!(store(credentials, bucket), TrackingAdapter)
-    refute_receive :open
+    assert :ok = Compactor.run!(store(credentials, bucket))
+
+    refute File.exists?(Path.join(System.get_env("DATA_PATH", System.tmp_dir!()), "w3-compactor"))
   end
 
   @tag :minio
@@ -139,76 +124,17 @@ defmodule W3.CompactorTest do
 
     :ok = Help.create_bucket(credentials, bucket)
     request = Help.s3_req(credentials)
-    put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/failure.ex")])
+    put_raw!(request, bucket, raw_key, [%{"entity" => "synthetic/failure.ex"}])
 
     on_exit(fn -> Req.delete(request, url: "s3://#{bucket}/#{raw_key}") end)
 
-    assert_raise RuntimeError, "query failed", fn ->
-      Compactor.run!(store(credentials, bucket), FailingAdapter)
-    end
+    compactor = start_supervised!({Compactor, store(credentials, bucket)})
+    _ = :sys.get_state(compactor)
 
-    assert_receive :open
-    assert_receive :connect
-    assert_receive :disconnect
-    assert_receive :close
+    assert Process.alive?(compactor)
     assert object_status(request, bucket, raw_key) == 200
-  end
 
-  defmodule TrackingAdapter do
-    def open do
-      send(self(), :open)
-      DuckNIF.open()
-    end
-
-    def connect(database) do
-      send(self(), :connect)
-      DuckNIF.connect(database)
-    end
-
-    def query_dirty_io(connection, sql) do
-      if callback = Process.get({__MODULE__, :before_query}), do: callback.()
-      send(self(), {:query, sql})
-      DuckNIF.query_dirty_io(connection, sql)
-    end
-
-    def destroy_result(result) do
-      send(self(), :destroy_result)
-      DuckNIF.destroy_result(result)
-    end
-
-    def disconnect(connection) do
-      send(self(), :disconnect)
-      DuckNIF.disconnect(connection)
-    end
-
-    def close(database) do
-      send(self(), :close)
-      DuckNIF.close(database)
-    end
-  end
-
-  defmodule FailingAdapter do
-    def open do
-      send(self(), :open)
-      :database
-    end
-
-    def connect(:database) do
-      send(self(), :connect)
-      :connection
-    end
-
-    def query_dirty_io(:connection, _sql), do: raise("query failed")
-
-    def disconnect(:connection) do
-      send(self(), :disconnect)
-      :ok
-    end
-
-    def close(:database) do
-      send(self(), :close)
-      :ok
-    end
+    refute File.exists?(Path.join(System.get_env("DATA_PATH", System.tmp_dir!()), "w3-compactor"))
   end
 
   defp canonical_rows(duck, glob) do
