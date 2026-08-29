@@ -7,3 +7,5 @@
 !config/runtime.exs
 !lib
 !lib/**
+!rel
+!rel/**

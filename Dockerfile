@@ -14,7 +14,10 @@ RUN mix deps.get --only prod && mix deps.compile
 
 COPY config/runtime.exs config/
 COPY lib lib
-RUN mix compile && mix release
+COPY rel rel
+RUN mix compile \
+    && W3_MODE=compactor mix run --no-start -e 'database = DuckNIF.open(); connection = DuckNIF.connect(database); try do result = DuckNIF.query_dirty_io(connection, "INSTALL httpfs"); DuckNIF.destroy_result(result) after DuckNIF.disconnect(connection); DuckNIF.close(database) end' \
+    && mix release
 
 FROM alpine:3.23.5 AS app
 
@@ -31,6 +34,7 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 COPY --from=build --chown=w3:w3 /app/_build/prod/rel/w3 ./
+COPY --from=build --chown=w3:w3 /root/.duckdb /app/.duckdb
 
 USER w3
 
