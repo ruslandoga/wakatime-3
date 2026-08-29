@@ -28,7 +28,11 @@ events.
 ## Run
 
 ```sh
-docker run --rm -p 4000:4000 \
+docker run --detach \
+  --name w3 \
+  --restart always \
+  --pull always \
+  --publish 4000:4000 \
   -e API_KEY=your-wakatime-shaped-api-key \
   -e AWS_S3_BUCKET=w3 \
   -e AWS_REGION=auto \
