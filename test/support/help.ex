@@ -53,6 +53,16 @@ defmodule Help do
       end)
       |> Keyword.put_new(:interval, to_timeout(second: 1))
       |> Keyword.put_new(:max_buffer_size, 1)
+      |> Keyword.put_new_lazy(:spool_dir, fn ->
+        path =
+          Path.join(
+            System.tmp_dir!(),
+            "w3-#{System.unique_integer([:positive, :monotonic])}"
+          )
+
+        ExUnit.Callbacks.on_exit(fn -> File.rm_rf!(path) end)
+        path
+      end)
 
     ExUnit.Callbacks.start_supervised!({W3.Ingester, options})
   end

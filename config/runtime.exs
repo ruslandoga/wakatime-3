@@ -29,7 +29,8 @@ config :w3,
   ],
   ingester: [
     interval: parse_integer.("W3_BATCH_INTERVAL_MS", "30000"),
-    max_buffer_size: parse_integer.("W3_MAX_BUFFER_SIZE", "10000000")
+    max_buffer_size: parse_integer.("W3_MAX_BUFFER_SIZE", "10000000"),
+    spool_dir: System.get_env("W3_SPOOL_DIR", "data/spool")
   ],
   s3: [
     bucket: fetch_in.([:s3, :bucket], "AWS_S3_BUCKET"),
