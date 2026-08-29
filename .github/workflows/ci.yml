@@ -6,6 +6,9 @@ on:
     branches:
       - master
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -60,6 +63,27 @@ jobs:
       - run: mix dialyzer --format github
 
   image:
+    if: github.event_name == 'pull_request'
+    needs: test
+    permissions:
+      contents: read
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    with:
+      output: image
+      push: false
+      platforms: linux/amd64,linux/arm64
+      cache: true
+      cache-mode: max
+      set-meta-labels: true
+      meta-images: ghcr.io/${{ github.repository }}
+      meta-tags: |
+        type=ref,event=branch
+        type=ref,event=pr
+        type=raw,value=latest,enable={{is_default_branch}}
+        type=sha
+
+  publish-image:
+    if: github.event_name == 'push'
     needs: test
     permissions:
       contents: read
@@ -68,7 +92,7 @@ jobs:
     uses: docker/github-builder/.github/workflows/build.yml@v1
     with:
       output: image
-      push: ${{ github.event_name == 'push' }}
+      push: true
       platforms: linux/amd64,linux/arm64
       cache: true
       cache-mode: max
