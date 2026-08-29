@@ -18,6 +18,13 @@ content-addressed key makes an identical request retry idempotent. WakaTime can 
 heartbeats into a different batch, so the later Parquet stage should still deduplicate individual
 events.
 
+## Previous versions
+
+- [`wakatime-2`](https://github.com/ruslandoga/wakatime-2) — a single-container WakaTime
+  clone built with SQLite, Phoenix LiveView, and Litestream.
+- [`wakatime-1`](https://github.com/ruslandoga/wakatime-1) — a local Docker Compose setup
+  using PostgreSQL, Grafana, and a heartbeat ingester.
+
 ## Run
 
 ```sh
