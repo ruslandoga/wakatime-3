@@ -24,8 +24,8 @@ defmodule W3.Compactor do
   def handle_info(:compact, s3) do
     try do
       run!(s3)
-    rescue
-      _exception -> :ok
+    catch
+      _kind, _reason -> :ok
     after
       Process.send_after(self(), :compact, :timer.hours(24))
     end

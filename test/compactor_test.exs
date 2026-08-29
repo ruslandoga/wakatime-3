@@ -1,5 +1,5 @@
 defmodule W3.CompactorTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 
