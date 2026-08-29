@@ -55,11 +55,16 @@ defmodule Help do
   end
 
   def start_duck(s3_credentials) do
-    database = ExUnit.Callbacks.start_supervised!({Adbc.Database, driver: :duckdb})
-    duck = ExUnit.Callbacks.start_supervised!({Adbc.Connection, database: database})
+    duck = DuckNIF.open()
+    conn = DuckNIF.connect(duck)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      DuckNIF.disconnect(conn)
+      DuckNIF.close(duck)
+    end)
 
     %{"Success" => [true]} =
-      quack(duck, """
+      quack(conn, """
       CREATE OR REPLACE SECRET secret (
         TYPE s3,
         PROVIDER config,
@@ -72,13 +77,45 @@ defmodule Help do
       );
       """)
 
-    duck
+    conn
   end
 
-  def quack(duck, sql, params \\ []) do
-    duck
-    |> Adbc.Connection.query!(sql, params)
-    |> Adbc.Result.to_map()
+  def quack(conn, sql) do
+    result = DuckNIF.query_dirty_io(conn, sql)
+
+    try do
+      columns =
+        case DuckNIF.column_count(result) do
+          0 -> []
+          count -> Enum.map(0..(count - 1), &{&1, DuckNIF.column_name(result, &1)})
+        end
+
+      values = Map.new(columns, fn {_index, name} -> {name, []} end)
+      fetch_chunks(result, columns, values)
+    after
+      DuckNIF.destroy_result(result)
+    end
+  end
+
+  defp fetch_chunks(result, columns, values) do
+    case DuckNIF.fetch_chunk(result) do
+      nil ->
+        Map.new(values, fn {name, vectors} ->
+          {name, vectors |> Enum.reverse() |> Enum.flat_map(& &1)}
+        end)
+
+      chunk ->
+        values =
+          try do
+            Enum.reduce(columns, values, fn {index, name}, values ->
+              Map.update!(values, name, &[DuckNIF.data_chunk_get_vector(chunk, index) | &1])
+            end)
+          after
+            DuckNIF.destroy_data_chunk(chunk)
+          end
+
+        fetch_chunks(result, columns, values)
+    end
   end
 
   def attach_telemetry(events) do
