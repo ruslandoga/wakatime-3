@@ -1,9 +1,11 @@
 # w3
 
-`w3` is a small WakaTime-compatible HTTP endpoint that forwards raw heartbeats directly to S3 or
-Cloudflare R2.
+`w3` is a small WakaTime-compatible HTTP endpoint that forwards raw heartbeats directly to object storage.
 
-WakaTime already batches heartbeats in its local BoltDB, so `w3` does not maintain another buffer.
+> [!NOTE]
+>
+> WakaTime already batches heartbeats in its local BoltDB, so `w3` does not maintain another buffer.
+
 For each incoming bulk request it:
 
 1. Adds the request's machine name and timezone to every heartbeat.
@@ -17,8 +19,6 @@ heartbeats into a different batch, so the later Parquet stage should still dedup
 events.
 
 ## Run
-
-The published image supports `linux/amd64` and `linux/arm64`:
 
 ```sh
 docker run --rm -p 4000:4000 \
@@ -40,8 +40,3 @@ api_key = your-wakatime-shaped-api-key
 offline = true
 heartbeat_rate_limit_seconds = 300
 ```
-
-The five-minute rate limit is optional; WakaTime defaults to two minutes. It stores intervening
-heartbeats locally and sends up to ten in each bulk request. Do not deliberately return errors to
-create batches: API failures activate WakaTime's exponential backoff. A crash-safe server-side
-outbox is intentionally deferred to [#21](https://github.com/ruslandoga/wakatime-3/issues/21).
