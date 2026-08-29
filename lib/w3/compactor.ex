@@ -6,37 +6,10 @@ defmodule W3.Compactor do
   its database and connection exist only while the local merge is running.
   """
 
-  @columns [
-    "time",
-    "entity",
-    "type",
-    "category",
-    "project",
-    "branch",
-    "language",
-    "dependencies",
-    "lines",
-    "lineno",
-    "cursorpos",
-    "is_write",
-    "editor",
-    "operating_system",
-    "machine_name",
-    "timezone",
-    "user_agent"
-  ]
-
-  @identity Enum.reject(@columns, &(&1 in ["timezone", "user_agent"]))
-  @identity_partition Enum.join(@identity, ", ")
-
   def run!, do: run!(Application.fetch_env!(:w3, :s3))
   def run!(s3), do: run!(s3, DuckNIF)
 
   def run!(s3, adapter) do
-    :global.trans({__MODULE__, self()}, fn -> run_locked!(s3, adapter) end)
-  end
-
-  defp run_locked!(s3, adapter) do
     s3 = store!(s3)
     request = request(s3)
     directory = Path.join(System.tmp_dir!(), "w3-compactor")
@@ -114,7 +87,7 @@ defmodule W3.Compactor do
         ""
       else
         """
-        SELECT #{Enum.join(@columns, ", ")}
+        SELECT *
         FROM read_parquet(
           #{sql_quote(Path.join(canonical_directory, "*.parquet"))},
           union_by_name = true
@@ -122,8 +95,6 @@ defmodule W3.Compactor do
         UNION ALL
         """
       end
-
-    output_columns = Enum.map_join(@columns, ",\n", &"event.#{&1}")
 
     """
     SET TimeZone = 'UTC';
@@ -197,15 +168,30 @@ defmodule W3.Compactor do
         END
       ), event AS (
         #{existing}
-        SELECT #{Enum.join(@columns, ", ")}
+        SELECT *
         FROM raw
       )
       SELECT
-        #{output_columns},
+        event.*,
         year(timezone('UTC', event.time))::INTEGER AS year
       FROM event
       QUALIFY row_number() OVER (
-        PARTITION BY #{@identity_partition}
+        PARTITION BY
+          time,
+          entity,
+          type,
+          category,
+          project,
+          branch,
+          language,
+          dependencies,
+          lines,
+          lineno,
+          cursorpos,
+          is_write,
+          editor,
+          operating_system,
+          machine_name
         ORDER BY
           (nullif(timezone, '') IS NOT NULL)::INTEGER +
             (nullif(user_agent, '') IS NOT NULL)::INTEGER DESC,

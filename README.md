@@ -71,9 +71,8 @@ running release, for example from the host scheduler:
 docker exec CONTAINER /app/bin/w3 rpc 'W3.Compactor.run!()'
 ```
 
-Start with one run per day rather than one run per heartbeat upload. Calls in the same running release
-are serialized; keep one application replica if a host scheduler can overlap runs. The database and
-connection are created and closed on every non-empty run, including failures.
+Start with one local run per day rather than one run per heartbeat upload. The database and connection
+are created and closed on every non-empty run, including failures.
 
 Canonical files use UTC `TIMESTAMPTZ`, Parquet V2 data pages, Zstandard compression, and 122,880-row
 groups. Routine analytics query only this dataset—not raw NDJSON:
