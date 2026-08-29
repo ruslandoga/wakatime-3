@@ -1,4 +1,4 @@
-FROM hexpm/elixir:1.20.3-erlang-29.0.5-alpine-3.24.1 AS build
+FROM hexpm/elixir:1.20.3-erlang-29.0.5-alpine-3.23.5 AS build
 
 WORKDIR /app
 
@@ -16,7 +16,7 @@ COPY config/runtime.exs config/
 COPY lib lib
 RUN mix compile && mix release
 
-FROM alpine:3.24.1 AS app
+FROM alpine:3.23.5 AS app
 
 RUN apk add --no-cache \
         ca-certificates \
