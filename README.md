@@ -28,7 +28,7 @@ events.
 ## Run
 
 ```sh
-docker run --rm -p 6767:6767 \
+docker run --rm -p 6767:6767 --name=w3 \
   -e HTTP_PORT=6767 \
   -e API_KEY=your-wakatime-shaped-api-key \
   -e AWS_S3_BUCKET=w3 \
