@@ -1,9 +1,9 @@
 defmodule W3.Compactor do
   @moduledoc """
-  Appends new raw heartbeats to the canonical Hive-partitioned Parquet dataset.
+  Merges a snapshot of raw heartbeats into the annual Parquet files.
 
-  Each invocation owns one in-memory DuckDB database and one connection. Both
-  are closed before the function returns or raises.
+  Object I/O is handled by Req. DuckDB only sees temporary local files, and
+  its database and connection exist only while the local merge is running.
   """
 
   @columns [
@@ -29,22 +29,77 @@ defmodule W3.Compactor do
   @identity Enum.reject(@columns, &(&1 in ["timezone", "user_agent"]))
   @identity_partition Enum.join(@identity, ", ")
 
-  @existing_match Enum.map_join(@identity, " AND\n", fn column ->
-                    "raw.#{column} IS NOT DISTINCT FROM existing.#{column}"
-                  end)
+  def run!, do: run!(Application.fetch_env!(:w3, :s3))
+  def run!(s3), do: run!(s3, DuckNIF)
 
-  @output_columns Enum.map_join(@columns, ",\n", &"raw.#{&1}")
+  def run!(s3, adapter) do
+    :global.trans({__MODULE__, self()}, fn -> run_locked!(s3, adapter) end)
+  end
 
-  def run!(raw, canonical, adapter \\ DuckNIF) do
-    raw = store!(raw)
-    canonical = store!(canonical)
+  defp run_locked!(s3, adapter) do
+    s3 = store!(s3)
+    request = request(s3)
+    directory = Path.join(System.tmp_dir!(), "w3-compactor")
+    File.rm_rf!(directory)
+
+    raw_keys =
+      request
+      |> list_keys(s3.bucket, "raw/")
+      |> Enum.filter(&String.ends_with?(&1, ".ndjson.zst"))
+
+    if raw_keys == [] do
+      :ok
+    else
+      compact!(request, s3.bucket, raw_keys, directory, adapter)
+    end
+  end
+
+  defp compact!(request, bucket, raw_keys, directory, adapter) do
+    raw_directory = Path.join(directory, "raw")
+    canonical_directory = Path.join(directory, "canonical")
+    output_directory = Path.join(directory, "output")
+
+    Enum.each([raw_directory, canonical_directory, output_directory], &File.mkdir_p!/1)
+
+    try do
+      download!(request, bucket, raw_keys, raw_directory, ".ndjson.zst")
+
+      canonical_keys =
+        request
+        |> list_keys(bucket, "v1/year=")
+        |> Enum.filter(&Regex.match?(~r|\Av1/year=\d{4}/heartbeats\.parquet\z|, &1))
+
+      download!(request, bucket, canonical_keys, canonical_directory, ".parquet")
+      query!(sql(raw_directory, canonical_directory, output_directory, canonical_keys), adapter)
+
+      outputs = Path.wildcard(Path.join(output_directory, "year=*/*.parquet"))
+
+      if outputs == [] do
+        raise "compaction produced no Parquet files"
+      end
+
+      Enum.each(outputs, &upload!(request, bucket, &1))
+      Enum.each(raw_keys, &delete!(request, bucket, &1))
+      :ok
+    after
+      File.rm_rf!(directory)
+    end
+  end
+
+  defp query!(sql, adapter) do
     database = adapter.open()
 
     try do
       connection = adapter.connect(database)
 
       try do
-        query!(connection, sql(raw, canonical), adapter)
+        result = adapter.query_dirty_io(connection, sql)
+
+        try do
+          :ok
+        after
+          :ok = adapter.destroy_result(result)
+        end
       after
         :ok = adapter.disconnect(connection)
       end
@@ -53,33 +108,31 @@ defmodule W3.Compactor do
     end
   end
 
-  defp query!(connection, sql, adapter) do
-    result = adapter.query_dirty_io(connection, sql)
+  defp sql(raw_directory, canonical_directory, output_directory, canonical_keys) do
+    existing =
+      if canonical_keys == [] do
+        ""
+      else
+        """
+        SELECT #{Enum.join(@columns, ", ")}
+        FROM read_parquet(
+          #{sql_quote(Path.join(canonical_directory, "*.parquet"))},
+          union_by_name = true
+        )
+        UNION ALL
+        """
+      end
 
-    try do
-      :ok
-    after
-      :ok = adapter.destroy_result(result)
-    end
-  end
-
-  defp sql(raw, canonical) do
-    raw_path = "s3://#{raw.bucket}/raw/*.ndjson.zst"
-    canonical_path = "s3://#{canonical.bucket}/v1/year=*/*.parquet"
-    canonical_root = "s3://#{canonical.bucket}/v1"
+    output_columns = Enum.map_join(@columns, ",\n", &"event.#{&1}")
 
     """
-    LOAD httpfs;
-    SET enable_global_s3_configuration = false;
     SET TimeZone = 'UTC';
-    #{secret_sql("raw_store", raw)}
-    #{secret_sql("canonical_store", canonical)}
 
     COPY (
       WITH raw_input AS (
         SELECT *
         FROM read_ndjson(
-          #{sql_quote(raw_path)},
+          #{sql_quote(Path.join(raw_directory, "*.ndjson.zst"))},
           columns = {
             time: 'DOUBLE',
             entity: 'VARCHAR',
@@ -101,7 +154,7 @@ defmodule W3.Compactor do
           format = 'newline_delimited',
           union_by_name = true
         )
-      ), normalized AS (
+      ), raw AS (
         SELECT
           to_timestamp(time)::TIMESTAMPTZ AS time,
           entity::VARCHAR AS entity,
@@ -135,48 +188,35 @@ defmodule W3.Compactor do
           END::VARCHAR AS operating_system,
           machine_name::VARCHAR AS machine_name,
           timezone::VARCHAR AS timezone,
-          user_agent::VARCHAR AS user_agent,
-          year(timezone('UTC', to_timestamp(time)))::INTEGER AS year
+          user_agent::VARCHAR AS user_agent
         FROM raw_input
-      ), raw AS (
-        SELECT *
-        FROM normalized
         WHERE CASE
           WHEN time IS NULL OR entity IS NULL OR type IS NULL OR machine_name IS NULL THEN
             error('heartbeat is missing a required field')
           ELSE true
         END
-        QUALIFY row_number() OVER (
-          PARTITION BY #{@identity_partition}
-          ORDER BY
-            (nullif(timezone, '') IS NOT NULL)::INTEGER +
-              (nullif(user_agent, '') IS NOT NULL)::INTEGER DESC,
-            timezone DESC NULLS LAST,
-            user_agent DESC NULLS LAST
-        ) = 1
-      ), existing AS (
+      ), event AS (
+        #{existing}
         SELECT #{Enum.join(@columns, ", ")}
-        FROM read_parquet(
-          #{sql_quote(canonical_path)},
-          hive_partitioning = true,
-          union_by_name = true
-        )
+        FROM raw
       )
       SELECT
-        #{@output_columns},
-        raw.year
-      FROM raw
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM existing
-        WHERE #{@existing_match}
-      )
-      ORDER BY raw.year, raw.time, raw.entity
-    ) TO #{sql_quote(canonical_root)} (
+        #{output_columns},
+        year(timezone('UTC', event.time))::INTEGER AS year
+      FROM event
+      QUALIFY row_number() OVER (
+        PARTITION BY #{@identity_partition}
+        ORDER BY
+          (nullif(timezone, '') IS NOT NULL)::INTEGER +
+            (nullif(user_agent, '') IS NOT NULL)::INTEGER DESC,
+          timezone DESC NULLS LAST,
+          user_agent DESC NULLS LAST
+      ) = 1
+      ORDER BY year, time, entity
+    ) TO #{sql_quote(output_directory)} (
       FORMAT PARQUET,
       PARTITION_BY (year),
-      APPEND true,
-      FILENAME_PATTERN 'heartbeats_{uuid}',
+      FILENAME_PATTERN 'heartbeats',
       COMPRESSION ZSTD,
       COMPRESSION_LEVEL 3,
       PARQUET_VERSION V2,
@@ -185,30 +225,78 @@ defmodule W3.Compactor do
     """
   end
 
-  defp secret_sql(name, store) do
-    {endpoint, use_ssl} = endpoint(store.endpoint_url)
+  defp request(s3) do
+    Req.new(retry: :transient)
+    |> ReqS3.attach(
+      aws_sigv4: [
+        region: s3.region,
+        access_key_id: s3.access_key_id,
+        secret_access_key: s3.secret_access_key
+      ],
+      aws_endpoint_url_s3: s3.endpoint_url
+    )
+  end
 
-    session_token =
-      case store.session_token do
-        nil -> ""
-        value -> ", SESSION_TOKEN #{sql_quote(value)}"
+  defp list_keys(request, bucket, prefix) do
+    list_keys(request, bucket, prefix, nil, [])
+  end
+
+  defp list_keys(request, bucket, prefix, continuation_token, pages) do
+    params = %{"list-type" => "2", "prefix" => prefix}
+
+    params =
+      if continuation_token do
+        Map.put(params, "continuation-token", continuation_token)
+      else
+        params
       end
 
-    """
-    CREATE SECRET #{name} (
-      TYPE s3,
-      PROVIDER config,
-      KEY_ID #{sql_quote(store.access_key_id)},
-      SECRET #{sql_quote(store.secret_access_key)},
-      ENDPOINT #{sql_quote(endpoint)},
-      REGION #{sql_quote(store.region)},
-      URL_STYLE path,
-      USE_SSL #{use_ssl},
-      SCOPE #{sql_quote("s3://#{store.bucket}/")}
-      #{session_token}
-    );
-    """
+    response = Req.get!(request, url: "s3://#{bucket}", params: params) |> success!()
+    result = response.body["ListBucketResult"]
+    page = Enum.map(result["Contents"] || [], &Map.fetch!(&1, "Key"))
+    pages = [page | pages]
+
+    if result["IsTruncated"] == "true" do
+      list_keys(request, bucket, prefix, Map.fetch!(result, "NextContinuationToken"), pages)
+    else
+      pages |> Enum.reverse() |> List.flatten()
+    end
   end
+
+  defp download!(request, bucket, keys, directory, extension) do
+    keys
+    |> Enum.with_index()
+    |> Enum.each(fn {key, index} ->
+      response = Req.get!(request, url: "s3://#{bucket}/#{key}", raw: true) |> success!()
+      File.write!(Path.join(directory, "#{index}#{extension}"), response.body)
+    end)
+  end
+
+  defp upload!(request, bucket, path) do
+    year = output_year!(path)
+
+    Req.put!(request,
+      url: "s3://#{bucket}/v1/year=#{year}/heartbeats.parquet",
+      headers: %{"content-type" => "application/vnd.apache.parquet"},
+      body: File.read!(path)
+    )
+    |> success!()
+
+    :ok
+  end
+
+  defp output_year!(path) do
+    [_, year] = Regex.run(~r|/year=(\d{4})/[^/]+\.parquet\z|, path)
+    year
+  end
+
+  defp delete!(request, bucket, key) do
+    Req.delete!(request, url: "s3://#{bucket}/#{key}") |> success!()
+    :ok
+  end
+
+  defp success!(%{status: status} = response) when status in 200..299, do: response
+  defp success!(%{status: status}), do: raise("S3 request failed with status #{status}")
 
   defp store!(store) do
     store = Map.new(store)
@@ -220,18 +308,7 @@ defmodule W3.Compactor do
       end
     end
 
-    Map.put_new(store, :session_token, nil)
-  end
-
-  defp endpoint(url) do
-    case URI.parse(url) do
-      %URI{scheme: scheme, authority: authority, path: path}
-      when scheme in ["http", "https"] and is_binary(authority) ->
-        {authority <> String.trim_trailing(path || "", "/"), scheme == "https"}
-
-      _ ->
-        raise ArgumentError, "invalid compactor S3 endpoint"
-    end
+    store
   end
 
   defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"

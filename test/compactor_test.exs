@@ -2,38 +2,38 @@ defmodule W3.CompactorTest do
   use ExUnit.Case, async: true
 
   alias W3.Compactor
+  alias W3.CompactorTest.{FailingAdapter, TrackingAdapter}
 
   @user_agent "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 " <>
                 "vscode/1.68.0-insider vscode-wakatime/18.1.5"
 
   @tag :minio
-  test "one DuckDB query appends only new canonical events" do
+  test "merges a raw snapshot locally and deletes exactly that snapshot" do
     credentials = Help.s3_credentials(:minio)
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
-    raw_bucket = "w3-compact-raw-#{suffix}"
-    canonical_bucket = "w3-compact-canonical-#{suffix}"
+    bucket = "w3-compact-#{suffix}"
     first_raw_key = "raw/first.ndjson.zst"
     second_raw_key = "raw/second.ndjson.zst"
+    late_raw_key = "raw/late.ndjson.zst"
 
-    :ok = Help.create_bucket(credentials, raw_bucket)
-    :ok = Help.create_bucket(credentials, canonical_bucket)
+    :ok = Help.create_bucket(credentials, bucket)
 
     duck = Help.start_duck(credentials)
     request = Help.s3_req(credentials)
 
     on_exit(fn ->
-      files =
-        Help.quack(
-          duck,
-          "SELECT file FROM glob('s3://#{canonical_bucket}/v1/year=*/*.parquet')"
-        )["file"]
-
-      Enum.each(files, &Req.delete(request, url: &1))
-      Req.delete(request, url: "s3://#{raw_bucket}/#{first_raw_key}")
-      Req.delete(request, url: "s3://#{raw_bucket}/#{second_raw_key}")
+      for key <- [
+            first_raw_key,
+            second_raw_key,
+            late_raw_key,
+            "v1/year=2025/heartbeats.parquet",
+            "v1/year=2026/heartbeats.parquet"
+          ] do
+        Req.delete(request, url: "s3://#{bucket}/#{key}")
+      end
     end)
 
-    seed_legacy!(duck, canonical_bucket)
+    seed_legacy!(duck, bucket)
 
     existing =
       heartbeat(
@@ -51,45 +51,48 @@ defmodule W3.CompactorTest do
 
     variant = Map.put(new, "is_write", false)
 
-    put_raw!(request, raw_bucket, first_raw_key, [existing, new])
-    put_raw!(request, raw_bucket, second_raw_key, [new, variant])
+    late =
+      heartbeat(
+        time: unix_seconds(~U[2026-01-01 00:01:00Z]),
+        entity: "synthetic/late.ex",
+        is_write: true
+      )
 
-    assert :ok =
-             Compactor.run!(store(credentials, raw_bucket), store(credentials, canonical_bucket))
+    put_raw!(request, bucket, first_raw_key, [existing, new])
+    put_raw!(request, bucket, second_raw_key, [new, variant])
 
-    canonical_glob = "s3://#{canonical_bucket}/v1/year=*/*.parquet"
+    Process.put({TrackingAdapter, :before_query}, fn ->
+      put_raw!(request, bucket, late_raw_key, [late])
+    end)
+
+    on_exit(fn -> Process.delete({TrackingAdapter, :before_query}) end)
+
+    assert :ok = Compactor.run!(store(credentials, bucket), TrackingAdapter)
+
+    assert_receive :open
+    assert_receive :connect
+    assert_receive {:query, sql}
+    assert length(Regex.scan(~r/\bCOPY \(/, sql)) == 1
+    refute sql =~ "s3://"
+    assert_receive :destroy_result
+    assert_receive :disconnect
+    assert_receive :close
+
+    assert object_status(request, bucket, first_raw_key) == 404
+    assert object_status(request, bucket, second_raw_key) == 404
+    assert object_status(request, bucket, late_raw_key) == 200
+
+    canonical_glob = "s3://#{bucket}/v1/year=*/heartbeats.parquet"
     _ = Help.quack(duck, "SET TimeZone = 'Europe/Moscow'")
 
-    assert Help.quack(
-             duck,
-             """
-             SELECT year, entity, is_write, timezone, user_agent
-             FROM read_parquet(
-               '#{canonical_glob}',
-               hive_partitioning = true,
-               union_by_name = true
-             )
-             ORDER BY year, entity, is_write
-             """
-           ) == %{
+    assert canonical_rows(duck, canonical_glob) == %{
              "entity" => ["synthetic/existing.ex", "synthetic/new.ex", "synthetic/new.ex"],
              "is_write" => [false, false, true],
-             "timezone" => [nil, "Europe/Moscow", "Europe/Moscow"],
-             "user_agent" => [nil, @user_agent, @user_agent],
+             "timezone" => ["Europe/Moscow", "Europe/Moscow", "Europe/Moscow"],
              "year" => [2025, 2025, 2025]
            }
 
-    files_before =
-      Help.quack(duck, "SELECT file FROM glob('#{canonical_glob}') ORDER BY file")["file"]
-
-    assert length(files_before) == 2
-    assert Enum.any?(files_before, &String.ends_with?(&1, "/year=2025/heartbeats.parquet"))
-
-    assert Enum.any?(files_before, fn file ->
-             String.match?(file, ~r{/year=2025/heartbeats_[0-9a-f-]+\.parquet$})
-           end)
-
-    new_file = Enum.find(files_before, &String.contains?(&1, "/heartbeats_"))
+    canonical_2025 = "s3://#{bucket}/v1/year=2025/heartbeats.parquet"
 
     assert Help.quack(
              duck,
@@ -97,79 +100,90 @@ defmodule W3.CompactorTest do
              SELECT
                min(format_version) AS format_version,
                count(*) FILTER (WHERE compression <> 'ZSTD') AS non_zstd
-             FROM parquet_metadata('#{new_file}')
-             CROSS JOIN parquet_file_metadata('#{new_file}')
+             FROM parquet_metadata('#{canonical_2025}')
+             CROSS JOIN parquet_file_metadata('#{canonical_2025}')
              """
            ) == %{"format_version" => [2], "non_zstd" => [0]}
 
-    assert :ok =
-             Compactor.run!(store(credentials, raw_bucket), store(credentials, canonical_bucket))
+    Process.delete({TrackingAdapter, :before_query})
+    assert :ok = Compactor.run!(store(credentials, bucket))
+    assert object_status(request, bucket, late_raw_key) == 404
 
-    assert Help.quack(duck, "SELECT file FROM glob('#{canonical_glob}') ORDER BY file")["file"] ==
-             files_before
+    assert canonical_rows(duck, canonical_glob) == %{
+             "entity" => [
+               "synthetic/existing.ex",
+               "synthetic/new.ex",
+               "synthetic/new.ex",
+               "synthetic/late.ex"
+             ],
+             "is_write" => [false, false, true, true],
+             "timezone" => [
+               "Europe/Moscow",
+               "Europe/Moscow",
+               "Europe/Moscow",
+               "Europe/Moscow"
+             ],
+             "year" => [2025, 2025, 2025, 2026]
+           }
+
+    assert :ok = Compactor.run!(store(credentials, bucket), TrackingAdapter)
+    refute_receive :open
   end
 
-  test "the database and connection close after every run" do
-    assert :ok =
-             Compactor.run!(
-               fake_store("raw"),
-               fake_store("canonical"),
-               W3.CompactorTest.Adapter
-             )
+  @tag :minio
+  test "a failed local merge closes DuckDB and preserves raw" do
+    credentials = Help.s3_credentials(:minio)
+    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
+    bucket = "w3-compact-failure-#{suffix}"
+    raw_key = "raw/failure.ndjson.zst"
 
-    assert_receive :open
-    assert_receive :connect
-    assert_receive {:query, sql}
-    assert length(Regex.scan(~r/\bCOPY \(/, sql)) == 1
-    assert_receive :destroy_result
-    assert_receive :disconnect
-    assert_receive :close
-  end
+    :ok = Help.create_bucket(credentials, bucket)
+    request = Help.s3_req(credentials)
+    put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/failure.ex")])
 
-  test "the database and connection also close when DuckDB raises" do
+    on_exit(fn -> Req.delete(request, url: "s3://#{bucket}/#{raw_key}") end)
+
     assert_raise RuntimeError, "query failed", fn ->
-      Compactor.run!(
-        fake_store("raw"),
-        fake_store("canonical"),
-        W3.CompactorTest.FailingAdapter
-      )
+      Compactor.run!(store(credentials, bucket), FailingAdapter)
     end
 
     assert_receive :open
     assert_receive :connect
     assert_receive :disconnect
     assert_receive :close
+    assert object_status(request, bucket, raw_key) == 200
   end
 
-  defmodule Adapter do
+  defmodule TrackingAdapter do
     def open do
       send(self(), :open)
-      :database
+      DuckNIF.open()
     end
 
-    def connect(:database) do
+    def connect(database) do
       send(self(), :connect)
-      :connection
+      DuckNIF.connect(database)
     end
 
-    def query_dirty_io(:connection, sql) do
+    def query_dirty_io(connection, sql) do
+      if callback = Process.get({__MODULE__, :before_query}), do: callback.()
       send(self(), {:query, sql})
-      :result
+      DuckNIF.query_dirty_io(connection, sql)
     end
 
-    def destroy_result(:result) do
+    def destroy_result(result) do
       send(self(), :destroy_result)
-      :ok
+      DuckNIF.destroy_result(result)
     end
 
-    def disconnect(:connection) do
+    def disconnect(connection) do
       send(self(), :disconnect)
-      :ok
+      DuckNIF.disconnect(connection)
     end
 
-    def close(:database) do
+    def close(database) do
       send(self(), :close)
-      :ok
+      DuckNIF.close(database)
     end
   end
 
@@ -195,6 +209,17 @@ defmodule W3.CompactorTest do
       send(self(), :close)
       :ok
     end
+  end
+
+  defp canonical_rows(duck, glob) do
+    Help.quack(
+      duck,
+      """
+      SELECT year, entity, is_write, timezone
+      FROM read_parquet('#{glob}', hive_partitioning = true, union_by_name = true)
+      ORDER BY year, entity, is_write
+      """
+    )
   end
 
   defp seed_legacy!(duck, bucket) do
@@ -248,17 +273,10 @@ defmodule W3.CompactorTest do
     assert status in 200..299
   end
 
-  defp unix_seconds(datetime), do: DateTime.to_unix(datetime, :microsecond) / 1_000_000
-
-  defp store(credentials, bucket), do: Map.put(credentials, :bucket, bucket)
-
-  defp fake_store(bucket) do
-    %{
-      bucket: bucket,
-      region: "auto",
-      endpoint_url: "https://example.com",
-      access_key_id: "access",
-      secret_access_key: "secret"
-    }
+  defp object_status(request, bucket, key) do
+    Req.head!(request, url: "s3://#{bucket}/#{key}").status
   end
+
+  defp unix_seconds(datetime), do: DateTime.to_unix(datetime, :microsecond) / 1_000_000
+  defp store(credentials, bucket), do: Map.put(credentials, :bucket, bucket)
 end

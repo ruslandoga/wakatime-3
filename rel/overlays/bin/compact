@@ -1,5 +1,0 @@
-#!/bin/sh
-set -eu
-
-export W3_MODE=compactor
-exec "$(dirname "$0")/w3" eval 'W3.Compactor.CLI.run!()'
