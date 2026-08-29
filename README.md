@@ -37,6 +37,5 @@ Point WakaTime at the service in `~/.wakatime.cfg`:
 [settings]
 api_url = http://127.0.0.1:4000
 api_key = your-wakatime-shaped-api-key
-offline = true
 heartbeat_rate_limit_seconds = 300
 ```
