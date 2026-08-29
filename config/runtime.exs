@@ -27,10 +27,6 @@ config :w3,
     port:
       parse_integer.("HTTP_PORT", get_in(Application.get_all_env(:w3), [:http, :port]) || "4000")
   ],
-  ingester: [
-    interval: parse_integer.("W3_BATCH_INTERVAL_MS", "30000"),
-    max_buffer_size: parse_integer.("W3_MAX_BUFFER_SIZE", "10000000")
-  ],
   s3: [
     bucket: fetch_in.([:s3, :bucket], "AWS_S3_BUCKET"),
     region: System.get_env("AWS_REGION", "us-east-1"),

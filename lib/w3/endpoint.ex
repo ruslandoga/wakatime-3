@@ -2,10 +2,12 @@ defmodule W3.Endpoint do
   @moduledoc false
   use Plug.Router
 
+  require Logger
+
   def start_link(options) do
     {api_key, options} = Keyword.pop!(options, :api_key)
-    {ingester, options} = Keyword.pop!(options, :ingester)
-    Bandit.start_link([plug: {__MODULE__, %{api_key: api_key, ingester: ingester}}] ++ options)
+    {s3, options} = Keyword.pop!(options, :s3)
+    Bandit.start_link([plug: {__MODULE__, %{api_key: api_key, s3: s3}}] ++ options)
   end
 
   def child_spec(options) do
@@ -19,12 +21,12 @@ defmodule W3.Endpoint do
   def call(conn, config) do
     %{
       api_key: api_key,
-      ingester: ingester
+      s3: s3
     } = config
 
     conn
     |> put_private(:api_key, api_key)
-    |> put_private(:ingester, ingester)
+    |> put_private(:s3, s3)
     |> super(_no_opts = [])
   end
 
@@ -38,14 +40,6 @@ defmodule W3.Endpoint do
     json_decoder: JSON
 
   plug :dispatch
-
-  post "/heartbeats" do
-    handle_heartbeats(conn)
-  end
-
-  post "/heartbeats/v1/users/current/heartbeats.bulk" do
-    handle_heartbeats(conn)
-  end
 
   post "/users/current/heartbeats.bulk" do
     handle_heartbeats(conn)
@@ -95,19 +89,31 @@ defmodule W3.Endpoint do
     %{"_json" => heartbeats} = conn.body_params
 
     [machine_name] = get_req_header(conn, "x-machine-name")
-    W3.Ingester.insert_heartbeats!(conn.private.ingester, heartbeats, machine_name)
 
-    json = JSON.encode_to_iodata!(%{"responses" => Enum.map(heartbeats, fn _ -> [nil, 201] end)})
+    metadata =
+      %{"machine_name" => URI.decode_www_form(machine_name)}
+      |> put_metadata("timezone", get_req_header(conn, "timezone"))
 
-    conn
-    |> put_resp_header("content-type", "application/json; charset=utf-8")
-    |> send_resp(201, json)
+    case W3.Ingester.insert_heartbeats(conn.private.s3, heartbeats, metadata) do
+      :ok ->
+        json =
+          JSON.encode_to_iodata!(%{"responses" => Enum.map(heartbeats, fn _ -> [nil, 201] end)})
+
+        conn
+        |> put_resp_header("content-type", "application/json; charset=utf-8")
+        |> send_resp(201, json)
+
+      {:error, reason} ->
+        Logger.warning("failed to upload heartbeats: #{inspect(reason)}")
+        send_resp(conn, 503, "service unavailable")
+    end
   end
+
+  defp put_metadata(metadata, _key, []), do: metadata
+  defp put_metadata(metadata, key, [value]), do: Map.put(metadata, key, value)
 
   @doc false
   def log_errors(conn) do
-    require Logger
-
     %{"logs" => logs} = conn.body_params
 
     logs
