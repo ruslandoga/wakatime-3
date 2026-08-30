@@ -20,7 +20,7 @@ defmodule W3.Compactor do
 
     task = {__MODULE__, :compact!, [%{s3: s3, data_path: data_path}]}
 
-    W3.Periodic.start_link({interval, backoff, task})
+    W3.Periodic.start_link(interval: interval, backoff: backoff, task: task)
   end
 
   def child_spec(options) do

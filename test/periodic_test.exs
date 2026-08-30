@@ -32,7 +32,9 @@ defmodule W3.PeriodicTest do
                  :internal,
                  {:run, failure_count},
                  :no_state,
-                 {100, backoff, fn -> raise "failed run" end}
+                 interval: 100,
+                 backoff: backoff,
+                 task: fn -> raise "failed run" end
                )
 
       assert delay in 1..upper_bound
@@ -44,7 +46,9 @@ defmodule W3.PeriodicTest do
                :internal,
                {:run, 3},
                :no_state,
-               {100, backoff, fn -> :ok end}
+               interval: 100,
+               backoff: backoff,
+               task: fn -> :ok end
              )
   end
 
@@ -53,7 +57,7 @@ defmodule W3.PeriodicTest do
 
     start_supervised!(%{
       id: make_ref(),
-      start: {W3.Periodic, :start_link, [{10, backoff, task}]}
+      start: {W3.Periodic, :start_link, [[interval: 10, backoff: backoff, task: task]]}
     })
   end
 end

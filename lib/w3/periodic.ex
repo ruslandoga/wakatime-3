@@ -8,8 +8,8 @@ defmodule W3.Periodic do
 
   @behaviour :gen_statem
 
-  def start_link(state) do
-    :gen_statem.start_link(__MODULE__, state, [])
+  def start_link(options) do
+    :gen_statem.start_link(__MODULE__, options, [])
   end
 
   @impl :gen_statem
@@ -18,8 +18,12 @@ defmodule W3.Periodic do
   end
 
   @impl :gen_statem
-  def init({interval, _backoff, _task} = state) do
-    {:ok, :nostate, state, schedule(interval, _failure_count = 0)}
+  def init(options) do
+    interval = Keyword.fetch!(options, :interval)
+    backoff = Keyword.fetch!(options, :backoff)
+    task = Keyword.fetch!(options, :task)
+    data = [interval: interval, backoff: backoff, task: task]
+    {:ok, :nostate, data, schedule(interval, _failure_count = 0)}
   end
 
   @impl :gen_statem
@@ -27,7 +31,11 @@ defmodule W3.Periodic do
     {:keep_state_and_data, {:next_event, :internal, {:run, failure_count}}}
   end
 
-  def handle_event(:internal, {:run, failure_count}, _state, {interval, backoff, task}) do
+  def handle_event(:internal, {:run, failure_count}, _state, options) do
+    interval = Keyword.fetch!(options, :interval)
+    backoff = Keyword.fetch!(options, :backoff)
+    task = Keyword.fetch!(options, :task)
+
     next =
       try do
         run(task)
