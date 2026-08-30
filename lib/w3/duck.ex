@@ -4,6 +4,8 @@ defmodule W3.Duck do
   and data-chunk APIs.
   """
 
+  def sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"
+
   @doc "Opens a DuckDB connection for the function and closes it afterward."
   def with_duck(fun) when is_function(fun, 1) do
     db = DuckNIF.open()
