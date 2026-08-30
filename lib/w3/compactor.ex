@@ -6,53 +6,17 @@ defmodule W3.Compactor do
   its database and connection exist only while the local merge is running.
   """
 
-  @behaviour :gen_statem
-
   def start_link(options) do
-    :gen_statem.start_link(__MODULE__, options, [])
+    s3 = options |> Keyword.fetch!(:s3) |> Map.new()
+    data_path = Keyword.fetch!(options, :data_path)
+    interval = Keyword.get(options, :interval, to_timeout(second: 60))
+    task = {__MODULE__, :compact!, [%{s3: s3, data_path: data_path}]}
+
+    W3.Periodic.start_link({interval, task})
   end
 
   def child_spec(options) do
     %{id: __MODULE__, start: {__MODULE__, :start_link, [options]}}
-  end
-
-  @impl :gen_statem
-  def callback_mode do
-    :handle_event_function
-  end
-
-  @impl :gen_statem
-  def init(options) do
-    s3 = Keyword.fetch!(options, :s3)
-    data_path = Keyword.fetch!(options, :data_path)
-    interval = Keyword.get(options, :interval, to_timeout(second: 60))
-
-    config = %{
-      s3: Map.new(s3),
-      data_path: data_path,
-      interval: interval
-    }
-
-    next = {{:timeout, :compact}, interval, _no_content = []}
-    {:ok, :no_state, config, next}
-  end
-
-  @impl :gen_statem
-  def handle_event(type, content, state, data)
-
-  def handle_event({:timeout, :compact}, [], _state, _data) do
-    {:keep_state_and_data, {:next_event, :internal, :compact}}
-  end
-
-  def handle_event(:internal, :compact, _state, data) do
-    try do
-      compact!(data)
-    rescue
-      _exception -> :ok
-    end
-
-    next = {{:timeout, :compact}, data.interval, _no_content = []}
-    {:keep_state_and_data, next}
   end
 
   def compact!(%{s3: s3, data_path: data_path}) do
