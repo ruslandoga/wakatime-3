@@ -221,8 +221,8 @@ defmodule W3.Compactor do
         params
       end
 
-    response = Req.get!(req, url: "s3://#{bucket}", params: params) |> success!()
-    result = response.body["ListBucketResult"]
+    %{status: 200, body: body} = Req.get!(req, url: "s3://#{bucket}", params: params)
+    result = body["ListBucketResult"]
     page = Enum.map(result["Contents"] || [], &Map.fetch!(&1, "Key"))
     pages = [page | pages]
 
@@ -239,21 +239,23 @@ defmodule W3.Compactor do
     async_map!(
       Enum.with_index(keys),
       fn {key, index} ->
-        response = Req.get!(req, url: "s3://#{s3.bucket}/#{key}", raw: true) |> success!()
+        %{status: 200, body: body} =
+          Req.get!(req, url: "s3://#{s3.bucket}/#{key}", raw: true)
+
         path = Path.join(directory, "#{index}#{extension}")
-        File.write!(path, response.body)
+        File.write!(path, body)
         %{key: key, path: path}
       end
     )
   end
 
   defp upload!(s3, %{key: key, path: path}) do
-    Req.put!(req(s3),
-      url: "s3://#{s3.bucket}/#{key}",
-      headers: %{"content-type" => "application/vnd.apache.parquet"},
-      body: File.read!(path)
-    )
-    |> success!()
+    %{status: 200} =
+      Req.put!(req(s3),
+        url: "s3://#{s3.bucket}/#{key}",
+        headers: %{"content-type" => "application/vnd.apache.parquet"},
+        body: File.read!(path)
+      )
 
     :ok
   end
@@ -264,14 +266,8 @@ defmodule W3.Compactor do
   end
 
   defp delete!(s3, key) do
-    Req.delete!(req(s3), url: "s3://#{s3.bucket}/#{key}") |> success!()
+    %{status: 204} = Req.delete!(req(s3), url: "s3://#{s3.bucket}/#{key}")
     :ok
-  end
-
-  defp success!(%{status: status} = response) when status in 200..299, do: response
-
-  defp success!(response) do
-    :erlang.error({:s3_response, Map.take(response, [:status, :headers, :body])})
   end
 
   defp async_map!(enumerable, fun) do

@@ -383,7 +383,7 @@ defmodule W3.CompactorTest do
 
     log =
       capture_log(fn ->
-        assert_raise ErlangError, fn ->
+        assert_raise MatchError, fn ->
           Compactor.compact!(config(credentials, bucket))
         end
       end)
@@ -392,12 +392,12 @@ defmodule W3.CompactorTest do
                     %{
                       bucket: ^bucket,
                       kind: :error,
-                      reason: {:s3_response, %{status: 404, headers: headers, body: body}}
+                      reason:
+                        {:badmatch, %Req.Response{status: 404, headers: headers, body: body}}
                     }}
 
     assert headers != %{}
     assert body != ""
-    assert log =~ ":s3_response"
     assert log =~ "status: 404"
     assert log =~ "NoSuchBucket"
   end

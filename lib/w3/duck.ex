@@ -13,10 +13,10 @@ defmodule W3.Duck do
       try do
         fun.(conn)
       after
-        :ok = DuckNIF.disconnect(conn)
+        DuckNIF.disconnect(conn)
       end
     after
-      :ok = DuckNIF.close(db)
+      DuckNIF.close(db)
     end
   end
 
@@ -31,10 +31,10 @@ defmodule W3.Duck do
       try do
         read_chunks(result)
       after
-        :ok = DuckNIF.destroy_result(result)
+        DuckNIF.destroy_result(result)
       end
     after
-      :ok = DuckNIF.destroy_prepare(stmt)
+      DuckNIF.destroy_prepare(stmt)
     end
   end
 
@@ -51,7 +51,7 @@ defmodule W3.Duck do
               {name, DuckNIF.data_chunk_get_vector(chunk, index)}
             end)
           after
-            :ok = DuckNIF.destroy_data_chunk(chunk)
+            DuckNIF.destroy_data_chunk(chunk)
           end
 
         read_chunks(result, columns, [values | chunks])
@@ -74,19 +74,19 @@ defmodule W3.Duck do
 
       cond do
         is_binary(value) ->
-          :ok = DuckNIF.bind_varchar(stmt, idx, value)
+          DuckNIF.bind_varchar(stmt, idx, value)
 
         is_integer(value) ->
-          :ok = DuckNIF.bind_int64(stmt, idx, value)
+          DuckNIF.bind_int64(stmt, idx, value)
 
         is_float(value) ->
-          :ok = DuckNIF.bind_double(stmt, idx, value)
+          DuckNIF.bind_double(stmt, idx, value)
 
         is_boolean(value) ->
-          :ok = DuckNIF.bind_boolean(stmt, idx, value)
+          DuckNIF.bind_boolean(stmt, idx, value)
 
         is_nil(value) ->
-          :ok = DuckNIF.bind_null(stmt, idx)
+          DuckNIF.bind_null(stmt, idx)
 
         true ->
           raise ArgumentError,
