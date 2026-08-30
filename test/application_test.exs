@@ -5,7 +5,6 @@ defmodule W3.ApplicationTest do
     config = W3.config()
 
     assert Keyword.fetch!(config, :api_key) == "406fe41f-6d69-4183-a4cc-121e0c524c2b"
-    assert Keyword.fetch!(config, :compactor) == [initial_delay: :timer.hours(24)]
     assert Keyword.fetch!(config, :http) == [scheme: :http, port: 0]
     refute Keyword.has_key?(config, :ingester)
 

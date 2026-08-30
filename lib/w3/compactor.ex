@@ -10,13 +10,14 @@ defmodule W3.Compactor do
 
   require Logger
 
-  def start_link({s3, options}) do
-    GenServer.start_link(__MODULE__, {s3, options}, name: __MODULE__)
+  def start_link(options) do
+    GenServer.start_link(__MODULE__, options, name: __MODULE__)
   end
 
   @impl true
-  def init({s3, options}) do
-    Process.send_after(self(), :compact, Keyword.get(options, :initial_delay, 0))
+  def init(options) do
+    s3 = Keyword.fetch!(options, :s3)
+    send(self(), :compact)
     {:ok, s3}
   end
 
