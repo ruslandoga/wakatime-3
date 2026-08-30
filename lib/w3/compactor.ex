@@ -15,7 +15,7 @@ defmodule W3.Compactor do
       Keyword.get(
         options,
         :backoff,
-        %{base: to_timeout(second: 1), max: to_timeout(second: 60)}
+        %{base: to_timeout(second: 1), max: to_timeout(second: 30)}
       )
 
     task = {__MODULE__, :compact!, [%{s3: s3, data_path: data_path}]}
@@ -69,7 +69,7 @@ defmodule W3.Compactor do
       canonical_files =
         download!(s3, canonical_keys, canonical_directory, ".parquet")
 
-      query!(raw_files, canonical_files, output_directory)
+      sql(raw_files, canonical_files, output_directory)
 
       outputs =
         for partition <- File.ls!(output_directory),
@@ -88,151 +88,109 @@ defmodule W3.Compactor do
     end
   end
 
-  defp query!([], _canonical_files, _output_directory), do: :ok
-
-  defp query!(raw_files, canonical_files, output_directory) do
-    database = DuckNIF.open()
-
-    try do
-      connection = DuckNIF.connect(database)
-
-      try do
-        # The pinned DuckNIF's direct query error path releases its result before cleanup.
-        statement = DuckNIF.prepare(connection, sql(canonical_files, output_directory))
-
-        try do
-          bind_files(statement, "raw_files", raw_files)
-
-          if canonical_files != [] do
-            bind_files(statement, "canonical_files", canonical_files)
-          end
-
-          result = DuckNIF.execute_prepared_dirty_io(statement)
-
-          try do
-            :ok
-          after
-            :ok = DuckNIF.destroy_result(result)
-          end
-        after
-          :ok = DuckNIF.destroy_prepare(statement)
-        end
-      after
-        :ok = DuckNIF.disconnect(connection)
-      end
-    after
-      :ok = DuckNIF.close(database)
-    end
-  end
-
-  defp bind_files(statement, name, files) do
-    index = DuckNIF.bind_parameter_index(statement, name)
-    :ok = DuckNIF.bind_varchar(statement, index, JSON.encode!(files))
-  end
-
-  defp sql(canonical_files, output_directory) do
-    existing =
-      if canonical_files == [] do
-        ""
-      else
+  defp sql(raw_files, canonical_files, output_directory) do
+    W3.Duck.with_duck(fn conn ->
+      W3.Duck.query(
+        conn,
         """
-        SELECT *
-        FROM read_parquet(
-          from_json(CAST($canonical_files AS VARCHAR), '["VARCHAR"]'),
-          union_by_name = true
-        )
-        UNION ALL BY NAME
-        """
-      end
-
-    """
-    COPY (
-      WITH raw_input AS (
-        SELECT *
-        FROM read_ndjson(
-          from_json(CAST($raw_files AS VARCHAR), '["VARCHAR"]'),
-          columns = {
-            time: 'DOUBLE',
-            entity: 'VARCHAR',
-            type: 'VARCHAR',
-            category: 'VARCHAR',
-            project: 'VARCHAR',
-            branch: 'VARCHAR',
-            language: 'VARCHAR',
-            dependencies: 'VARCHAR[]',
-            lines: 'BIGINT',
-            lineno: 'BIGINT',
-            cursorpos: 'BIGINT',
-            is_write: 'BOOLEAN',
-            machine_name: 'VARCHAR',
-            timezone: 'VARCHAR',
-            user_agent: 'VARCHAR'
-          },
-          compression = 'zstd',
-          format = 'newline_delimited',
-          union_by_name = true
-        )
-      ), raw AS (
-        SELECT
-          to_timestamp(time)::TIMESTAMPTZ AS time,
-          entity::VARCHAR AS entity,
-          type::VARCHAR AS type,
-          category::VARCHAR AS category,
-          project::VARCHAR AS project,
-          branch::VARCHAR AS branch,
-          language::VARCHAR AS language,
-          dependencies::VARCHAR[] AS dependencies,
-          lines::BIGINT AS lines,
-          lineno::BIGINT AS lineno,
-          cursorpos::BIGINT AS cursorpos,
-          coalesce(is_write::BOOLEAN, false) AS is_write,
-          nullif(regexp_extract(user_agent, '(vscode/[^ ]+)', 1), '')::VARCHAR AS editor,
-          nullif(
-            regexp_extract(user_agent, '^wakatime/[^ ]+ [(]?([^ )]+)', 1),
-            ''
-          )::VARCHAR AS operating_system,
-          machine_name::VARCHAR AS machine_name,
-          timezone::VARCHAR AS timezone,
-          user_agent::VARCHAR AS user_agent
-        FROM raw_input
-      ), event AS (
-        #{existing}
-        SELECT *
-        FROM raw
+        COPY (
+          WITH raw_input AS (
+            SELECT *
+            FROM read_ndjson(
+              from_json(CAST($raw_files AS VARCHAR), '["VARCHAR"]'),
+              columns = {
+                time: 'DOUBLE',
+                entity: 'VARCHAR',
+                type: 'VARCHAR',
+                category: 'VARCHAR',
+                project: 'VARCHAR',
+                branch: 'VARCHAR',
+                language: 'VARCHAR',
+                dependencies: 'VARCHAR[]',
+                lines: 'BIGINT',
+                lineno: 'BIGINT',
+                cursorpos: 'BIGINT',
+                is_write: 'BOOLEAN',
+                machine_name: 'VARCHAR',
+                timezone: 'VARCHAR',
+                user_agent: 'VARCHAR'
+              },
+              compression = 'zstd',
+              format = 'newline_delimited',
+              union_by_name = true
+            )
+          ), raw AS (
+            SELECT
+              to_timestamp(time)::TIMESTAMPTZ AS time,
+              entity::VARCHAR AS entity,
+              type::VARCHAR AS type,
+              category::VARCHAR AS category,
+              project::VARCHAR AS project,
+              branch::VARCHAR AS branch,
+              language::VARCHAR AS language,
+              dependencies::VARCHAR[] AS dependencies,
+              lines::BIGINT AS lines,
+              lineno::BIGINT AS lineno,
+              cursorpos::BIGINT AS cursorpos,
+              coalesce(is_write::BOOLEAN, false) AS is_write,
+              nullif(regexp_extract(user_agent, '(vscode/[^ ]+)', 1), '')::VARCHAR AS editor,
+              nullif(
+                regexp_extract(user_agent, '^wakatime/[^ ]+ [(]?([^ )]+)', 1),
+                ''
+              )::VARCHAR AS operating_system,
+              machine_name::VARCHAR AS machine_name,
+              timezone::VARCHAR AS timezone,
+              user_agent::VARCHAR AS user_agent
+            FROM raw_input
+          ), event AS (
+            SELECT *
+            FROM read_parquet(
+              from_json(CAST($canonical_files AS VARCHAR), '["VARCHAR"]'),
+              union_by_name = true
+            )
+            UNION ALL BY NAME
+            SELECT *
+            FROM raw
+          )
+          SELECT
+            event.time,
+            event.entity,
+            event.type,
+            event.category,
+            event.project,
+            event.branch,
+            event.language,
+            event.dependencies,
+            event.lines,
+            event.lineno,
+            event.cursorpos,
+            event.is_write,
+            event.editor,
+            event.operating_system,
+            event.machine_name,
+            max(nullif(event.timezone, '')) AS timezone,
+            max(nullif(event.user_agent, '')) AS user_agent,
+            year(timezone('UTC', event.time))::INTEGER AS year
+          FROM event
+          WHERE event.time IS NOT NULL
+            AND event.entity IS NOT NULL
+            AND event.type IS NOT NULL
+            AND event.machine_name IS NOT NULL
+          GROUP BY ALL
+          ORDER BY year, time, entity
+        ) TO #{sql_quote(output_directory)} (
+          FORMAT PARQUET,
+          PARTITION_BY (year),
+          COMPRESSION ZSTD,
+          PARQUET_VERSION V2
+        );
+        """,
+        %{
+          "raw_files" => JSON.encode!(raw_files),
+          "canonical_files" => JSON.encode!(canonical_files)
+        }
       )
-      SELECT
-        event.time,
-        event.entity,
-        event.type,
-        event.category,
-        event.project,
-        event.branch,
-        event.language,
-        event.dependencies,
-        event.lines,
-        event.lineno,
-        event.cursorpos,
-        event.is_write,
-        event.editor,
-        event.operating_system,
-        event.machine_name,
-        max(nullif(event.timezone, '')) AS timezone,
-        max(nullif(event.user_agent, '')) AS user_agent,
-        year(timezone('UTC', event.time))::INTEGER AS year
-      FROM event
-      WHERE event.time IS NOT NULL
-        AND event.entity IS NOT NULL
-        AND event.type IS NOT NULL
-        AND event.machine_name IS NOT NULL
-      GROUP BY ALL
-      ORDER BY year, time, entity
-    ) TO #{sql_quote(output_directory)} (
-      FORMAT PARQUET,
-      PARTITION_BY (year),
-      COMPRESSION ZSTD,
-      PARQUET_VERSION V2
-    );
-    """
+    end)
   end
 
   defp req(s3) do
@@ -280,14 +238,10 @@ defmodule W3.Compactor do
     |> Task.Supervisor.async_stream_nolink(
       Enum.with_index(keys),
       fn {key, index} ->
-        try do
-          response = Req.get!(req, url: "s3://#{s3.bucket}/#{key}", raw: true) |> success!()
-          path = Path.join(directory, "#{index}#{extension}")
-          File.write!(path, response.body)
-          {:ok, path}
-        catch
-          kind, reason -> {:error, kind, reason, __STACKTRACE__}
-        end
+        response = Req.get!(req, url: "s3://#{s3.bucket}/#{key}", raw: true) |> success!()
+        path = Path.join(directory, "#{index}#{extension}")
+        File.write!(path, response.body)
+        {:ok, path}
       end,
       ordered: false,
       timeout: :infinity
@@ -320,7 +274,7 @@ defmodule W3.Compactor do
   defp success!(%{status: status} = response) when status in 200..299, do: response
 
   defp success!(response) do
-    :erlang.error({:s3_response, Map.take(response, [:status, :headers, :body])})
+    raise "unexpected response: #{inspect(response)}"
   end
 
   defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"

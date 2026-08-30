@@ -25,14 +25,14 @@ defmodule W3.Ingester do
     }
 
     :telemetry.span([:w3, :upload], metadata, fn ->
-      result = upload(s3, key, body)
-
-      {result, %{heartbeats: heartbeat_count, bytes: byte_count},
-       Map.put(metadata, :result, result)}
+      result = upload!(s3, key, body)
+      measurements = %{heartbeats: heartbeat_count, bytes: byte_count}
+      metadata = Map.put(metadata, :result, result)
+      {result, measurements, metadata}
     end)
   end
 
-  defp upload(s3, key, body) do
+  defp upload!(s3, key, body) do
     %{
       access_key_id: access_key_id,
       secret_access_key: secret_access_key,
@@ -51,16 +51,16 @@ defmodule W3.Ingester do
         ],
         aws_endpoint_url_s3: endpoint_url
       )
-      |> Req.put(
+      |> Req.put!(
         headers: %{"content-encoding" => "zstd", "content-type" => "application/x-ndjson"},
         url: "s3://#{bucket}/#{key}",
         body: body
       )
 
-    case response do
-      {:ok, %{status: status}} when status in 200..299 -> :ok
-      {:ok, %{status: status}} -> {:error, {:http_status, status}}
-      {:error, exception} -> {:error, exception}
+    if response.status in 200..299 do
+      :ok
+    else
+      {:error, response}
     end
   end
 end

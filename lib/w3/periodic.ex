@@ -19,7 +19,7 @@ defmodule W3.Periodic do
 
   @impl :gen_statem
   def init({interval, _backoff, _task} = state) do
-    {:ok, :no_state, state, schedule(interval, _failure_count = 0)}
+    {:ok, :nostate, state, schedule(interval, _failure_count = 0)}
   end
 
   @impl :gen_statem

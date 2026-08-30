@@ -34,6 +34,14 @@ defmodule W3.LoggerTelemetryHandler do
     end)
   end
 
+  def handle_event([:w3, :upload, :stop], measurements, %{result: :ok} = metadata, _config) do
+    Logger.info(fn ->
+      "uploaded #{measurements.heartbeats} heartbeat(s) " <>
+        "(#{measurements.bytes} compressed bytes) to " <>
+        "s3://#{metadata.bucket}/#{metadata.key} in #{duration(measurements)}ms"
+    end)
+  end
+
   def handle_event(
         [:w3, :upload, :stop],
         measurements,
@@ -48,19 +56,6 @@ defmodule W3.LoggerTelemetryHandler do
     end)
   end
 
-  def handle_event(
-        [:w3, :upload, :stop],
-        measurements,
-        %{result: :ok} = metadata,
-        _config
-      ) do
-    Logger.info(fn ->
-      "uploaded #{measurements.heartbeats} heartbeat(s) " <>
-        "(#{measurements.bytes} compressed bytes) to " <>
-        "s3://#{metadata.bucket}/#{metadata.key} in #{duration(measurements)}ms"
-    end)
-  end
-
   def handle_event([:w3, :upload, :exception], measurements, metadata, _config) do
     Logger.error(fn ->
       "failed to upload #{metadata.heartbeats} heartbeat(s) " <>
@@ -70,16 +65,13 @@ defmodule W3.LoggerTelemetryHandler do
     end)
   end
 
-  def handle_event(
-        [:w3, :log],
-        _measurements,
-        %{level: level, log: log},
-        _config
-      ) do
+  def handle_event([:w3, :log], _measurements, %{level: level, log: log}, _config) do
     Logger.log(level, log)
   end
 
-  defp duration(%{duration: duration}) do
+  defp duration(%{duration: duration}), do: duration(duration)
+
+  defp duration(duration) when is_integer(duration) do
     System.convert_time_unit(duration, :native, :millisecond)
   end
 
@@ -91,7 +83,6 @@ defmodule W3.LoggerTelemetryHandler do
     Exception.format(kind, reason)
   end
 
-  defp format_reason({:http_status, status}), do: "HTTP status #{status}"
-  defp format_reason(%{__exception__: true} = reason), do: Exception.format(:error, reason)
+  defp format_reason(reason) when is_exception(reason), do: Exception.format(:error, reason)
   defp format_reason(reason), do: inspect(reason)
 end
