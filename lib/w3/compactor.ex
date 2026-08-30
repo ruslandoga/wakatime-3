@@ -15,7 +15,7 @@ defmodule W3.Compactor do
       Keyword.get(
         options,
         :backoff,
-        W3.Backoff.new(base: to_timeout(second: 1), max: to_timeout(second: 60))
+        %{base: to_timeout(second: 1), max: to_timeout(second: 60)}
       )
 
     task = {__MODULE__, :compact!, [%{s3: s3, data_path: data_path}]}

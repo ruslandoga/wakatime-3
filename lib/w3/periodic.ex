@@ -7,7 +7,6 @@ defmodule W3.Periodic do
   """
 
   @behaviour :gen_statem
-  alias W3.Backoff
 
   def start_link(state) do
     :gen_statem.start_link(__MODULE__, state, [])
@@ -34,7 +33,7 @@ defmodule W3.Periodic do
         run(task)
       rescue
         _exception ->
-          delay = Backoff.delay(backoff, failure_count)
+          delay = backoff_delay(backoff, failure_count)
           schedule(delay, failure_count + 1)
       else
         _result ->
@@ -46,6 +45,10 @@ defmodule W3.Periodic do
 
   defp schedule(delay, failure_count) do
     {{:timeout, :run}, delay, failure_count}
+  end
+
+  defp backoff_delay(%{base: base, max: max}, failure_count) do
+    :rand.uniform(min(max, base * Integer.pow(2, failure_count)))
   end
 
   defp run({module, function, arguments}), do: apply(module, function, arguments)

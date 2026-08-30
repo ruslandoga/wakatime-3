@@ -278,7 +278,7 @@ defmodule W3.CompactorTest do
             {Compactor,
              s3: store(credentials, bucket),
              data_path: data_path(),
-             backoff: W3.Backoff.new(base: 1, max: 10),
+             backoff: %{base: 1, max: 10},
              interval: to_timeout(millisecond: 100)}
           )
 

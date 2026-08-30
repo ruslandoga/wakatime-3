@@ -21,18 +21,23 @@ defmodule W3.PeriodicTest do
   end
 
   test "backs off after an exception and resets after success" do
-    backoff = W3.Backoff.new(base: 1, max: 1)
+    backoff = %{base: 10, max: 25}
 
     assert {:keep_state_and_data, {:next_event, :internal, {:run, 2}}} =
              W3.Periodic.handle_event({:timeout, :run}, 2, :no_state, :data)
 
-    assert {:keep_state_and_data, {{:timeout, :run}, 1, 3}} =
-             W3.Periodic.handle_event(
-               :internal,
-               {:run, 2},
-               :no_state,
-               {100, backoff, fn -> raise "failed run" end}
-             )
+    for {failure_count, upper_bound} <- [{0, 10}, {1, 20}, {2, 25}, {10, 25}] do
+      assert {:keep_state_and_data, {{:timeout, :run}, delay, next_failure_count}} =
+               W3.Periodic.handle_event(
+                 :internal,
+                 {:run, failure_count},
+                 :no_state,
+                 {100, backoff, fn -> raise "failed run" end}
+               )
+
+      assert delay in 1..upper_bound
+      assert next_failure_count == failure_count + 1
+    end
 
     assert {:keep_state_and_data, {{:timeout, :run}, 100, 0}} =
              W3.Periodic.handle_event(
@@ -44,7 +49,7 @@ defmodule W3.PeriodicTest do
   end
 
   defp start_periodic(task) do
-    backoff = W3.Backoff.new(base: 1, max: 1)
+    backoff = %{base: 1, max: 1}
 
     start_supervised!(%{
       id: make_ref(),
