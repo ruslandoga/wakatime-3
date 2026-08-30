@@ -88,12 +88,16 @@ defmodule W3.EndpointTest do
 
       telemetry_ref = Help.attach_telemetry([[:w3, :ingester, :upload, :stop]])
 
-      assert %{status: 201, body: %{"responses" => [[nil, 201]]}} =
-               Req.post!(req, body: body)
+      logs =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %{status: 201, body: %{"responses" => [[nil, 201]]}} =
+                   Req.post!(req, body: body)
+        end)
 
-      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _,
+      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, %{heartbeats: 1},
                       %{bucket: ^bucket, key: key}}
 
+      assert logs =~ "heartbeats ingested: 1"
       assert key =~ ~r|\Araw/[0-9a-f]{64}\.ndjson\.zst\z|
       duck = Help.start_duck(Help.s3_credentials(:minio))
 
@@ -170,7 +174,7 @@ defmodule W3.EndpointTest do
                    Req.post!(req, body: JSON.encode_to_iodata!([Help.heartbeat()]))
         end)
 
-      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _,
+      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, %{heartbeats: 1},
                       %{bucket: ^bucket, result: {:error, {:http_status, 404}}}}
 
       assert logs =~ "failed to upload heartbeats: {:http_status, 404}"

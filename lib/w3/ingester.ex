@@ -12,10 +12,10 @@ defmodule W3.Ingester do
       |> IO.iodata_to_binary()
 
     id = :crypto.hash(:sha256, ndjson) |> Base.encode16(case: :lower)
-    upload(s3, "raw/#{id}.ndjson.zst", :zstd.compress(ndjson))
+    upload(s3, "raw/#{id}.ndjson.zst", :zstd.compress(ndjson), length(heartbeats))
   end
 
-  defp upload(s3, key, body) do
+  defp upload(s3, key, body, heartbeat_count) do
     %{
       access_key_id: access_key_id,
       secret_access_key: secret_access_key,
@@ -53,7 +53,7 @@ defmodule W3.Ingester do
           {:error, exception} -> {:error, exception}
         end
 
-      {result, Map.put(metadata, :result, result)}
+      {result, %{heartbeats: heartbeat_count}, Map.put(metadata, :result, result)}
     end)
   rescue
     exception -> {:error, exception}

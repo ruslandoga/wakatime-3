@@ -48,11 +48,14 @@ defmodule W3.LoggerTelemetryHandler do
 
   def handle_event(
         [:w3, :ingester, :upload, :stop],
-        _measurements,
-        %{result: :ok},
+        %{heartbeats: heartbeat_count},
+        %{result: :ok} = metadata,
         _config
       ) do
-    :ok
+    Logger.info("heartbeats ingested: #{heartbeat_count}",
+      bucket: metadata.bucket,
+      key: metadata.key
+    )
   end
 
   def handle_event([:w3, :ingester, :upload, :exception], _measurements, metadata, _config) do
