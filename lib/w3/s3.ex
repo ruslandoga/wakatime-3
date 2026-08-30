@@ -89,6 +89,11 @@ defmodule W3.S3 do
     )
   end
 
+  def object_url(s3, key) do
+    key = URI.encode(key, &(&1 == ?/ or URI.char_unreserved?(&1)))
+    "s3://#{s3.bucket}/#{key}"
+  end
+
   defp maybe_put(map, key, value) do
     if value, do: Map.put(map, key, value), else: map
   end

@@ -1,29 +1,17 @@
 # w3
 
-`w3` is a small WakaTime-compatible HTTP endpoint that forwards raw heartbeats directly to object storage.
+`w3` is a small WakaTime-compatible HTTP endpoint that stores heartbeats in S3-compatible object
+storage and compacts them into queryable Parquet.
 
-> [!NOTE]
->
-> WakaTime already batches heartbeats in its local BoltDB, so `w3` does not maintain another buffer.
-
-For each incoming bulk request it:
+WakaTime already buffers heartbeats in its local BoltDB, so `w3` does not maintain another queue.
+For each bulk request, it:
 
 1. Adds the request's machine name to every heartbeat.
-2. Encodes the batch as NDJSON and compresses it with zstd.
-3. Uploads it once to `raw/<sha256>.ndjson.zst`.
-4. Returns WakaTime's expected `201` response only after the object store returns 2xx.
+2. Encodes the batch as NDJSON and compresses it with Zstandard.
+3. Uploads it to a content-addressed `raw/<sha256>.ndjson.zst` key.
+4. Returns WakaTime's expected `201` only after object storage accepts the upload.
 
-An upload failure returns `503`, allowing WakaTime's offline queue and backoff to retry later. The
-content-addressed key makes an identical request retry idempotent. WakaTime can regroup retried
-heartbeats into a different batch, so a separate compactor deduplicates individual events into
-queryable Parquet.
-
-## Previous versions
-
-- [`wakatime-2`](https://github.com/ruslandoga/wakatime-2) — a single-container WakaTime
-  clone built with SQLite, Phoenix LiveView, and Litestream.
-- [`wakatime-1`](https://github.com/ruslandoga/wakatime-1) — a local Docker Compose setup
-  using PostgreSQL, Grafana, and a heartbeat ingester.
+An upload failure returns `503`, allowing WakaTime's offline queue and backoff to retry.
 
 ## Run
 
@@ -33,9 +21,9 @@ docker run --detach \
   --restart always \
   --pull always \
   --publish 6767:6767 \
-  --volume w3_data:/data \
+  --volume w3_tmp:/data \
   -e HTTP_PORT=6767 \
-  -e PLUG_TMPDIR=/data \
+  -e TMPDIR=/data \
   -e API_KEY=your-wakatime-shaped-api-key \
   -e AWS_S3_BUCKET=w3 \
   -e AWS_REGION=auto \
@@ -44,6 +32,10 @@ docker run --detach \
   -e AWS_SECRET_ACCESS_KEY=your-r2-secret-access-key \
   ghcr.io/ruslandoga/wakatime-3:latest
 ```
+
+The credentials need permission to list the bucket and to read, write, and delete its objects. Keep
+the bucket private: raw and processed data contain file paths, project and branch names, and machine
+metadata.
 
 Point WakaTime at the service in `~/.wakatime.cfg`:
 
@@ -54,60 +46,45 @@ api_key = your-wakatime-shaped-api-key
 heartbeat_rate_limit_seconds = 300
 ```
 
-## Compact
+## Storage and compaction
 
-Raw requests and queryable Parquet live in the same private bucket:
+Raw and processed objects share the configured bucket. Processed data is flat, not Hive-partitioned:
 
 ```text
-raw/<sha256>.ndjson.zst
-v1/year=YYYY/raw-<sha256-of-raw-key>.parquet
-v1/year=YYYY/heartbeats.parquet                 # legacy
+raw/<sha256-of-enriched-ndjson>.ndjson.zst
+processed/batch-<sha256-of-sorted-raw-keys>.parquet
 ```
 
-Each compaction lists `raw/` once and treats those exact keys as the run's generation. It uses
-Req to download that snapshot concurrently, opens a temporary local DuckDB database, and converts
-each raw object into one Parquet part per UTC event year. It never downloads existing Parquet, so
-routine work is proportional to new raw data instead of total history. Non-empty parts are uploaded
-concurrently, and the snapshotted raw objects are deleted only after every upload succeeds. New raw
-uploads wait for the next run.
+The compactor runs at startup and then 30 minutes after each successful run. It snapshots `raw/`,
+downloads those objects concurrently, converts valid events into one Parquet file, uploads it, and
+only then deletes the snapshotted raw objects. New raw objects wait for the next run. A deterministic
+batch key makes a retry of the same snapshot overwrite the same object.
 
-Each raw part key is derived from its source raw key and year. Since raw objects are content-addressed,
-a retry writes the same parts instead of creating another copy. Heartbeats missing
-`time`, `entity`, `type`, or `machine_name` are discarded; an object containing only such rows produces
-no part but is still deleted after successful processing. A malformed typed value fails the generation
-and leaves its raw objects in place for inspection or retry. Deduplication within one raw object happens
-during conversion.
+Rows missing `time`, `entity`, `type`, or `machine_name` are discarded; an all-invalid snapshot
+produces no Parquet object. Malformed typed values fail the compaction and leave its raw snapshot
+available for inspection or retry. Failures use full-jitter exponential backoff with a
+250-millisecond base and a 5-second cap.
 
-For now the compactor uses the application's existing read/write S3 credentials and bucket. Keep the
-bucket private: do not enable `r2.dev`, a public custom domain, or browser CORS. The application runs
-`W3.compact!/1` through a supervised `W3.Periodic` state machine. Raw conversion first runs after
-30 minutes, and each next run waits 30 minutes after the previous successful attempt finishes. Failed
-attempts retry with full-jitter exponential backoff using a one-second base and one-minute cap.
-Compactions emit telemetry under `[:w3, :compact]`, heartbeat uploads under `[:w3, :upload]`, and
-periodic attempts under `[:w3, :periodic]`; plugin logs use `[:w3, :log]`. Failed periodic attempts
-emit `[:w3, :periodic, :exception]`; every periodic span includes the task name, attempt number, and
-the backoff delay that will be used if it fails. All application logging is performed by a central
-telemetry handler. Span logs include elapsed time; upload logs also include heartbeat and
-compressed-byte counts, while exceptions include formatted error details.
+Parquet files use UTC `TIMESTAMPTZ`, Parquet V2, Zstandard compression, and a target row-group size of
+8,192 rows. Rows are ordered by `time`, then `entity`, so bounded time predicates can prune row groups
+using Parquet min/max statistics. Temporary files live under `TMPDIR` (`/tmp` by default) and are
+removed when the compaction task exits.
 
-Set `DATA_PATH` on the running container to choose the parent directory for temporary compaction
-files. It defaults to the system temporary directory; only its `w3-compactor` child is cleared.
+## Query
 
-Once conversion starts, its database and connection are scoped to that run and closed on success or
-failure; the state machine retains no DuckDB handle between runs.
-
-Parts use UTC `TIMESTAMPTZ`, Parquet V2 data pages, and Zstandard compression. Their UTC `year` is
-encoded by the Hive-style directory rather than repeated inside each file. Raw and legacy parts share
-one query layout. Analytics should query Parquet and deduplicate event identity, not scan raw NDJSON:
+Query `processed/` directly and explicitly disable Hive inference. `union_by_name` keeps older and
+newer schemas queryable together. DuckDB rejects the glob until the first processed file exists.
 
 ```sql
 WITH heartbeat AS (
   SELECT *
   FROM read_parquet(
-    's3://w3/v1/year=*/*.parquet',
-    hive_partitioning = true,
+    's3://w3/processed/*.parquet',
+    hive_partitioning = false,
     union_by_name = true
   )
+  WHERE time >= TIMESTAMPTZ '2026-01-01 00:00:00+00'
+    AND time <  TIMESTAMPTZ '2027-01-01 00:00:00+00'
 ), deduplicated AS (
   SELECT DISTINCT
     time,
@@ -122,27 +99,37 @@ WITH heartbeat AS (
     lineno,
     cursorpos,
     is_write,
-    machine_name,
-    year
+    machine_name
   FROM heartbeat
 )
-SELECT year, count(*) AS heartbeats
+SELECT year(timezone('UTC', time)) AS year, count(*) AS heartbeats
 FROM deduplicated
 GROUP BY year
 ORDER BY year;
 ```
 
-Do not issue the `read_parquet` call before the prefix contains a file; DuckDB rejects an unmatched
-Parquet glob. The example deliberately deduplicates on the legacy-stable event identity, so a heartbeat
-present in both an older annual file and a richer part counts once. Queries over AI or project-root
-fields should group on that same identity and prefer the part's non-null values.
+Deduplicate across files because WakaTime may regroup retried heartbeats into different raw batches,
+and a partial source-deletion failure can leave overlap between compaction runs. Fallback values such
+as `<<LAST_PROJECT>>`, `<<LAST_BRANCH>>`, and `<<LAST_LANGUAGE>>` remain literal; resolve them with
+event-time history in the query layer when needed.
 
-Fallback values such as `<<LAST_PROJECT>>`, `<<LAST_BRANCH>>`, and `<<LAST_LANGUAGE>>` stay literal in
-raw data and Parquet parts. They need prior-history context, so they should be resolved using
-event-time semantics in the query layer, not by the stateless raw compactor. Range queries must seed
-that state from earlier history and carry it across year boundaries; equal timestamps also need a
-stable event-field tie-breaker. Carry the last concrete project globally, then the last concrete branch
-and language within the effective project.
+## Development
 
-The event-level Parquet files contain private paths, project and branch names, and machine metadata,
-so only privacy-reviewed aggregates should be published to GitHub Pages.
+The project uses the Elixir and Erlang versions in `.tool-versions`.
+
+```sh
+mise install
+mix deps.get
+docker compose up --detach --wait minio
+mix test
+mix format --check-formatted
+mix dialyzer
+```
+
+MinIO-backed tests are skipped when MinIO is unavailable.
+
+## Previous versions
+
+- [`wakatime-2`](https://github.com/ruslandoga/wakatime-2) — SQLite, Phoenix LiveView, and Litestream.
+- [`wakatime-1`](https://github.com/ruslandoga/wakatime-1) — PostgreSQL, Grafana, and a heartbeat
+  ingester.

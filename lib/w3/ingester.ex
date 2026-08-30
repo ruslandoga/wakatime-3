@@ -14,30 +14,42 @@ defmodule W3.Ingester do
       )
 
     id = Base.encode16(:crypto.hash(:sha256, ndjson), case: :lower)
-    url = "s3://#{s3.bucket}/raw/#{id}.ndjson.zst"
+    key = "raw/#{id}.ndjson.zst"
     body = :zstd.compress(ndjson)
     heartbeat_count = length(heartbeats)
     byte_count = IO.iodata_length(body)
-    metadata = %{url: url}
+
+    metadata = %{
+      bucket: s3.bucket,
+      key: key,
+      heartbeats: heartbeat_count,
+      bytes: byte_count
+    }
 
     :telemetry.span([:w3, :upload], metadata, fn ->
-      upload!(s3, url, body)
+      result = upload(s3, key, body)
       measurements = %{heartbeats: heartbeat_count, bytes: byte_count}
-      {:ok, measurements, metadata}
+      {result, measurements, Map.put(metadata, :result, result)}
     end)
   end
 
-  defp upload!(s3, url, body) do
-    %{status: 200} =
+  defp upload(s3, key, body) do
+    response =
       s3
       |> W3.S3.base_req()
-      |> Req.put!(
+      |> Req.put(
         headers: %{
           "content-encoding" => "zstd",
           "content-type" => "application/x-ndjson"
         },
-        url: url,
+        url: W3.S3.object_url(s3, key),
         body: body
       )
+
+    case response do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, response} -> {:error, response}
+      {:error, reason} -> {:error, reason}
+    end
   end
 end

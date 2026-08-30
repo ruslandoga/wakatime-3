@@ -9,14 +9,20 @@ defmodule W3Test do
 
   @tag :minio
   test "s3 create bucket, put and get object, delete bucket", %{s3_req: s3_req} do
-    # Create bucket and delete on exit
-    on_exit(fn -> Req.delete!(s3_req, url: "s3://w3-test-bucket") end)
-    assert Req.put!(s3_req, url: "s3://w3-test-bucket")
+    bucket =
+      "w3-test-#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
 
-    # Put object
-    assert Req.put!(s3_req, url: "s3://w3-test-bucket/test-key", body: "Hello, S3!")
+    object_url = "s3://#{bucket}/test-key"
 
-    # Get object
-    assert Req.get!(s3_req, url: "s3://w3-test-bucket/test-key").body == "Hello, S3!"
+    on_exit(fn ->
+      Req.delete!(s3_req, url: object_url)
+      Req.delete!(s3_req, url: "s3://#{bucket}")
+    end)
+
+    assert %{status: 200} = Req.put!(s3_req, url: "s3://#{bucket}")
+
+    assert %{status: 200} = Req.put!(s3_req, url: object_url, body: "Hello, S3!")
+
+    assert %{status: 200, body: "Hello, S3!"} = Req.get!(s3_req, url: object_url)
   end
 end

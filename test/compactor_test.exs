@@ -17,28 +17,23 @@ defmodule W3.CompactorTest do
     :ok = Help.create_bucket(credentials, bucket)
     request = Help.s3_req(credentials)
     duck = Help.start_duck(credentials)
+    s3 = struct!(W3.S3, Map.put(credentials, :bucket, bucket))
 
     on_exit(fn -> delete_objects!(request, bucket) end)
 
-    {:ok, credentials: credentials, bucket: bucket, request: request, duck: duck}
+    {:ok, bucket: bucket, request: request, duck: duck, s3: s3}
   end
 
-  test "writes deterministic year parts for each raw object without changing legacy parquet", %{
-    credentials: credentials,
+  test "writes one deterministic, time-sorted Parquet batch", %{
     bucket: bucket,
     request: request,
     duck: duck,
-    tmp_dir: tmp_dir
+    s3: s3
   } do
     first_raw_key = "raw/first.ndjson.zst"
     second_raw_key = "raw/second\r.ndjson.zst"
-    first_2025_fragment_key = fragment_key(first_raw_key, 2025)
-    first_2026_fragment_key = fragment_key(first_raw_key, 2026)
-    second_fragment_key = fragment_key(second_raw_key, 2025)
+    processed_key = processed_key([first_raw_key, second_raw_key])
     legacy_key = "v1/year=2025/heartbeats.parquet"
-
-    seed_legacy!(duck, bucket)
-    legacy_body = object_body(request, bucket, legacy_key)
 
     first =
       heartbeat(
@@ -65,22 +60,18 @@ defmodule W3.CompactorTest do
         is_write: true
       )
 
-    variant = Map.put(new, "is_write", false)
-
     late =
       heartbeat(
         time: unix_seconds(~U[2026-01-01 00:01:00Z]),
         entity: "synthetic/late.ex",
-        is_write: true
+        project: "<<LAST_PROJECT>>",
+        branch: "<<LAST_BRANCH>>",
+        language: "<<LAST_LANGUAGE>>"
       )
-      |> Map.merge(%{
-        "project" => "<<LAST_PROJECT>>",
-        "branch" => "<<LAST_BRANCH>>",
-        "language" => "<<LAST_LANGUAGE>>"
-      })
 
-    put_raw!(request, bucket, first_raw_key, [first, late])
-    put_raw!(request, bucket, second_raw_key, [new, variant])
+    put_object!(request, bucket, legacy_key, "legacy stays untouched")
+    put_raw!(request, bucket, first_raw_key, [late, first])
+    put_raw!(request, bucket, second_raw_key, [new, first])
 
     telemetry_ref =
       Help.attach_telemetry([
@@ -90,63 +81,45 @@ defmodule W3.CompactorTest do
 
     log =
       capture_log(fn ->
-        assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
+        assert :ok = W3.Compactor.compact_raw_files_into_parquet(s3)
       end)
 
-    assert_receive {[:w3, :compact, :start], ^telemetry_ref,
-                    %{monotonic_time: monotonic_time, system_time: system_time},
-                    %{bucket: ^bucket}}
+    assert_receive {[:w3, :compact, :start], ^telemetry_ref, _, %{bucket: ^bucket}}
 
     assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: duration},
                     %{bucket: ^bucket}}
 
-    assert is_integer(monotonic_time)
-    assert is_integer(system_time)
     assert is_integer(duration)
     assert log =~ "heartbeat compaction complete"
-    assert log =~ "#{System.convert_time_unit(duration, :native, :millisecond)}ms"
     assert log =~ bucket
 
     assert object_status(request, bucket, first_raw_key) == 404
     assert object_status(request, bucket, second_raw_key) == 404
-    assert object_body(request, bucket, legacy_key) == legacy_body
+    assert object_body(request, bucket, legacy_key) == "legacy stays untouched"
+    assert object_keys(request, bucket, "processed/") == [processed_key]
 
-    assert object_keys(request, bucket, "v1/") ==
-             Enum.sort([
-               first_2025_fragment_key,
-               first_2026_fragment_key,
-               second_fragment_key,
-               legacy_key
-             ])
+    parquet = "s3://#{bucket}/#{processed_key}"
 
-    assert heartbeat_rows(duck, bucket, request) == %{
-             "entity" => [
-               "synthetic/existing.ex",
-               "synthetic/first.ex",
-               "synthetic/new.ex",
-               "synthetic/new.ex",
-               "synthetic/late.ex"
-             ],
-             "is_write" => [false, false, false, true, true],
-             "year" => [2025, 2025, 2025, 2025, 2026]
+    assert W3.Duck.query(
+             duck,
+             """
+             SELECT entity, is_write, year(timezone('UTC', time)) AS year
+             FROM read_parquet(
+               '#{parquet}',
+               file_row_number = true,
+               hive_partitioning = false
+             )
+             ORDER BY file_row_number
+             """
+           ) == %{
+             "entity" => ["synthetic/first.ex", "synthetic/new.ex", "synthetic/late.ex"],
+             "is_write" => [false, true, false],
+             "year" => [2025, 2025, 2026]
            }
 
-    first_fragment = "s3://#{bucket}/#{first_2025_fragment_key}"
-
     assert W3.Duck.query(
              duck,
-             """
-             SELECT
-               min(format_version) AS format_version,
-               count(*) FILTER (WHERE compression <> 'ZSTD') AS non_zstd
-             FROM parquet_metadata('#{first_fragment}')
-             CROSS JOIN parquet_file_metadata('#{first_fragment}')
-             """
-           ) == %{"format_version" => [2], "non_zstd" => [0]}
-
-    assert W3.Duck.query(
-             duck,
-             "DESCRIBE SELECT * FROM read_parquet('#{first_fragment}', hive_partitioning = false)"
+             "DESCRIBE SELECT * FROM read_parquet('#{parquet}', hive_partitioning = false)"
            )["column_name"] == [
              "time",
              "entity",
@@ -177,6 +150,17 @@ defmodule W3.CompactorTest do
              duck,
              """
              SELECT
+               min(format_version) AS format_version,
+               count(*) FILTER (WHERE compression <> 'ZSTD') AS non_zstd
+             FROM parquet_metadata('#{parquet}')
+             CROSS JOIN parquet_file_metadata('#{parquet}')
+             """
+           ) == %{"format_version" => [2], "non_zstd" => [0]}
+
+    assert W3.Duck.query(
+             duck,
+             """
+             SELECT
                ai_line_changes,
                ai_cached_input_tokens,
                ai_session,
@@ -186,7 +170,7 @@ defmodule W3.CompactorTest do
                ai_prompt_length,
                human_line_changes,
                project_root_count
-             FROM read_parquet('#{first_fragment}')
+             FROM read_parquet('#{parquet}', hive_partitioning = false)
              WHERE entity = 'synthetic/first.ex'
              """
            ) == %{
@@ -201,362 +185,152 @@ defmodule W3.CompactorTest do
              "project_root_count" => [8]
            }
 
-    assert W3.Duck.query(
-             duck,
-             """
-             SELECT entity, year
-             FROM read_parquet(
-               #{parquet_paths(bucket, [first_2025_fragment_key, first_2026_fragment_key])},
-               hive_partitioning = true
-             )
-             ORDER BY year
-             """
-           ) == %{
-             "entity" => ["synthetic/first.ex", "synthetic/late.ex"],
-             "year" => [2025, 2026]
-           }
+    # Replaying the same source snapshot overwrites its batch instead of duplicating it.
+    put_raw!(request, bucket, first_raw_key, [late, first])
+    put_raw!(request, bucket, second_raw_key, [new, first])
 
-    assert W3.Duck.query(
-             duck,
-             """
-             SELECT project, branch, language
-             FROM read_parquet('s3://#{bucket}/#{first_2026_fragment_key}')
-             """
-           ) == %{
-             "project" => ["<<LAST_PROJECT>>"],
-             "branch" => ["<<LAST_BRANCH>>"],
-             "language" => ["<<LAST_LANGUAGE>>"]
-           }
-
-    # Replaying an object overwrites its deterministic year parts instead of creating new ones.
-    put_raw!(request, bucket, first_raw_key, [first, late])
-    assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
-    assert object_status(request, bucket, first_raw_key) == 404
-
-    assert object_keys(request, bucket, "v1/") ==
-             Enum.sort([
-               first_2025_fragment_key,
-               first_2026_fragment_key,
-               second_fragment_key,
-               legacy_key
-             ])
-
-    assert object_body(request, bucket, legacy_key) == legacy_body
-
-    assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
+    assert :ok = W3.Compactor.compact_raw_files_into_parquet(s3)
+    assert object_keys(request, bucket, "processed/") == [processed_key]
   end
 
-  test "does not read legacy canonical parquet", %{
-    credentials: credentials,
+  test "uses 8,192-row groups ordered by time", %{tmp_dir: tmp_dir} do
+    raw_path = Path.join(tmp_dir, "heartbeats.ndjson.zst")
+    parquet_path = Path.join(tmp_dir, "heartbeats.parquet")
+    initial_time = 1_700_000_000
+
+    body =
+      19_999..0//-1
+      |> Enum.map(fn offset ->
+        heartbeat(time: initial_time + offset, entity: "synthetic/#{offset}.ex")
+      end)
+      |> Enum.map(&[JSON.encode_to_iodata!(&1), ?\n])
+      |> :zstd.compress()
+
+    File.write!(raw_path, body)
+    W3.Compactor.copy_raw_to_parquet([raw_path], parquet_path)
+
+    W3.Duck.with_duck(fn conn ->
+      assert W3.Duck.query(
+               conn,
+               """
+               SELECT row_group_num_rows AS rows
+               FROM parquet_metadata('#{parquet_path}')
+               WHERE path_in_schema = 'time'
+               ORDER BY row_group_id
+               """
+             ) == %{"rows" => [8192, 8192, 3616]}
+
+      assert W3.Duck.query(
+               conn,
+               """
+               WITH ordered AS (
+                 SELECT
+                   time,
+                   lag(time) OVER (ORDER BY file_row_number) AS previous_time
+                 FROM read_parquet(
+                   '#{parquet_path}',
+                   file_row_number = true,
+                   hive_partitioning = false
+                 )
+               )
+               SELECT count(*) FILTER (WHERE time < previous_time) AS out_of_order
+               FROM ordered
+               """
+             ) == %{"out_of_order" => [0]}
+    end)
+  end
+
+  test "drops rows missing required fields and returns noop with no raw data", %{
     bucket: bucket,
     request: request,
     duck: duck,
-    tmp_dir: tmp_dir
+    s3: s3
   } do
-    raw_key = "raw/ignores-canonical.ndjson.zst"
-    legacy_key = "v1/year=1999/heartbeats.parquet"
-    legacy_body = "intentionally not parquet"
+    raw_key = "raw/mixed.ndjson.zst"
 
-    put_object!(request, bucket, legacy_key, legacy_body)
-    put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/raw-only.ex")])
-
-    assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
-    assert object_status(request, bucket, raw_key) == 404
-    assert object_body(request, bucket, legacy_key) == legacy_body
-
-    assert fragment_rows(duck, bucket, request) == %{
-             "entity" => ["synthetic/raw-only.ex"],
-             "year" => [2022]
-           }
-  end
-
-  test "drops raw heartbeats missing required fields", %{
-    credentials: credentials,
-    bucket: bucket,
-    request: request,
-    duck: duck,
-    tmp_dir: tmp_dir
-  } do
-    invalid_raw_key = "raw/invalid.ndjson.zst"
-    valid_raw_key = "raw/valid.ndjson.zst"
-    invalid_fragment_key = fragment_key(invalid_raw_key, 2022)
-    valid_fragment_key = fragment_key(valid_raw_key, 2022)
-
-    invalid_heartbeats =
+    invalid =
       Enum.map(~w(time entity type machine_name), fn field ->
-        heartbeat(entity: "synthetic/invalid-#{field}.ex")
+        heartbeat(entity: "synthetic/missing-#{field}.ex")
         |> Map.delete(field)
       end)
 
-    put_raw!(request, bucket, invalid_raw_key, invalid_heartbeats)
+    put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/valid.ex") | invalid])
 
-    assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
-    assert object_status(request, bucket, invalid_raw_key) == 404
-    assert object_status(request, bucket, invalid_fragment_key) == 404
+    assert :ok = W3.Compactor.compact_raw_files_into_parquet(s3)
+    [processed_key] = object_keys(request, bucket, "processed/")
 
-    put_raw!(request, bucket, valid_raw_key, [
-      heartbeat(entity: "synthetic/valid.ex") | invalid_heartbeats
-    ])
+    assert W3.Duck.query(
+             duck,
+             "SELECT entity FROM read_parquet('s3://#{bucket}/#{processed_key}')"
+           ) == %{"entity" => ["synthetic/valid.ex"]}
 
-    assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
-    assert object_status(request, bucket, valid_raw_key) == 404
-    assert object_status(request, bucket, valid_fragment_key) == 200
+    assert :noop = W3.Compactor.compact_raw_files_into_parquet(s3)
+    assert object_keys(request, bucket, "processed/") == [processed_key]
 
-    assert fragment_rows(duck, bucket, request) == %{
-             "entity" => ["synthetic/valid.ex"],
-             "year" => [2022]
-           }
+    all_invalid_key = "raw/all-invalid.ndjson.zst"
+    put_raw!(request, bucket, all_invalid_key, invalid)
+
+    assert :ok = W3.Compactor.compact_raw_files_into_parquet(s3)
+    assert object_status(request, bucket, all_invalid_key) == 404
+    assert object_keys(request, bucket, "processed/") == [processed_key]
   end
 
-  test "runs on the configured interval", %{
-    credentials: credentials,
+  test "preserves the raw snapshot when conversion fails", %{
     bucket: bucket,
     request: request,
-    tmp_dir: tmp_dir
+    s3: s3
   } do
-    raw_key = "raw/scheduled.ndjson.zst"
-    fragment_key = fragment_key(raw_key, 2022)
-    local_data_path = Path.join(tmp_dir, "w3-compact\\'data")
+    invalid_key = "raw/invalid.ndjson.zst"
+    valid_key = "raw/valid.ndjson.zst"
 
-    put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/scheduled.ex")])
+    invalid = heartbeat(entity: "synthetic/invalid.ex") |> Map.put("time", "not-a-number")
 
-    telemetry_ref = Help.attach_telemetry([[:w3, :compact, :stop]])
-
-    pid =
-      start_compactor(
-        config(credentials, bucket, local_data_path),
-        interval: to_timeout(millisecond: 20)
-      )
-
-    assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: first_duration},
-                    %{bucket: ^bucket}},
-                   1_000
-
-    assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: second_duration},
-                    %{bucket: ^bucket}},
-                   1_000
-
-    assert first_duration >= 0
-    assert second_duration >= 0
-    assert Process.alive?(pid)
-    assert object_status(request, bucket, raw_key) == 404
-    assert object_status(request, bucket, fragment_key) == 200
-  end
-
-  test "retries after a scheduled failure", %{
-    credentials: credentials,
-    bucket: bucket,
-    request: request,
-    tmp_dir: tmp_dir
-  } do
-    raw_key = "raw/retry.ndjson.zst"
-    fragment_key = fragment_key(raw_key, 2022)
-
-    put_raw!(request, bucket, raw_key, [invalid_heartbeat()])
-
-    telemetry_ref =
-      Help.attach_telemetry([
-        [:w3, :compact, :exception],
-        [:w3, :compact, :stop]
-      ])
-
-    log =
-      capture_log(fn ->
-        pid =
-          start_compactor(
-            config(credentials, bucket, tmp_dir),
-            backoff: %{base: 1, max: 10},
-            interval: to_timeout(millisecond: 100)
-          )
-
-        assert_receive {[:w3, :compact, :exception], ^telemetry_ref, %{duration: _},
-                        %{bucket: ^bucket, reason: %DuckNIF.Error{}}},
-                       1_000
-
-        assert Process.alive?(pid)
-
-        put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/recovered.ex")])
-
-        assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: _},
-                        %{bucket: ^bucket}},
-                       1_000
-
-        assert Process.alive?(pid)
-      end)
-
-    assert log =~ "heartbeat compaction failed"
-    assert log =~ "heartbeat compaction complete"
-    assert object_status(request, bucket, raw_key) == 404
-    assert object_status(request, bucket, fragment_key) == 200
-  end
-
-  test "includes a failed S3 response in the error", %{
-    credentials: credentials,
-    bucket: bucket,
-    tmp_dir: tmp_dir
-  } do
-    bucket = "#{bucket}-missing"
-    telemetry_ref = Help.attach_telemetry([[:w3, :compact, :exception]])
-
-    log =
-      capture_log(fn ->
-        assert_raise MatchError, fn ->
-          W3.compact!(config(credentials, bucket, tmp_dir))
-        end
-      end)
-
-    assert_receive {[:w3, :compact, :exception], ^telemetry_ref, _,
-                    %{
-                      bucket: ^bucket,
-                      kind: :error,
-                      reason:
-                        {:badmatch, %Req.Response{status: 404, headers: headers, body: body}}
-                    }}
-
-    assert headers != %{}
-    assert body != ""
-    assert log =~ "status: 404"
-    assert log =~ "NoSuchBucket"
-  end
-
-  test "a malformed object preserves the whole raw batch for retry", %{
-    credentials: credentials,
-    bucket: bucket,
-    request: request,
-    tmp_dir: tmp_dir
-  } do
-    raw_key = "raw/failure.ndjson.zst"
-    valid_raw_key = "raw/valid.ndjson.zst"
-    valid_fragment_key = fragment_key(valid_raw_key, 2022)
-
-    put_raw!(request, bucket, raw_key, [invalid_heartbeat()])
-    put_raw!(request, bucket, valid_raw_key, [heartbeat(entity: "synthetic/valid.ex")])
-
-    telemetry_ref = Help.attach_telemetry([[:w3, :compact, :exception]])
+    put_raw!(request, bucket, invalid_key, [invalid])
+    put_raw!(request, bucket, valid_key, [heartbeat(entity: "synthetic/valid.ex")])
 
     log =
       capture_log(fn ->
         assert_raise DuckNIF.Error, fn ->
-          W3.compact!(config(credentials, bucket, tmp_dir))
+          W3.Compactor.compact_raw_files_into_parquet(s3)
         end
       end)
 
-    assert_receive {[:w3, :compact, :exception], ^telemetry_ref, %{duration: duration},
-                    %{
-                      bucket: ^bucket,
-                      kind: :error,
-                      reason: %DuckNIF.Error{} = reason,
-                      stacktrace: stacktrace
-                    }}
-
-    assert is_integer(duration)
-    assert is_list(stacktrace)
     assert log =~ "heartbeat compaction failed"
-    assert log =~ "#{System.convert_time_unit(duration, :native, :millisecond)}ms"
-    assert log =~ bucket
-    assert log =~ Exception.message(reason)
-    assert object_status(request, bucket, raw_key) == 200
-    assert object_status(request, bucket, valid_raw_key) == 200
-    assert object_status(request, bucket, valid_fragment_key) == 404
-    assert raw_fragment_keys(request, bucket) == []
-
-    refute File.exists?(Path.join(tmp_dir, "w3-compactor"))
+    assert object_status(request, bucket, invalid_key) == 200
+    assert object_status(request, bucket, valid_key) == 200
+    assert object_keys(request, bucket, "processed/") == []
   end
 
-  defp heartbeat_rows(duck, bucket, request) do
-    parts = parquet_part_keys(request, bucket)
+  test "includes a failed S3 response in the error", %{s3: s3} do
+    missing_bucket = "#{s3.bucket}-missing"
+    s3 = %{s3 | bucket: missing_bucket}
 
-    W3.Duck.query(
-      duck,
-      """
-      SELECT year, entity, is_write
-      FROM read_parquet(
-        #{parquet_paths(bucket, parts)},
-        hive_partitioning = true,
-        union_by_name = true
-      )
-      ORDER BY year, entity, is_write
-      """
-    )
-  end
+    log =
+      capture_log(fn ->
+        assert_raise MatchError, fn ->
+          W3.Compactor.compact_raw_files_into_parquet(s3)
+        end
+      end)
 
-  defp fragment_rows(duck, bucket, request) do
-    fragments = raw_fragment_keys(request, bucket)
-
-    W3.Duck.query(
-      duck,
-      """
-      SELECT entity, year
-      FROM read_parquet(#{parquet_paths(bucket, fragments)}, hive_partitioning = true)
-      ORDER BY year, entity
-      """
-    )
-  end
-
-  defp parquet_part_keys(request, bucket) do
-    request
-    |> object_keys(bucket, "v1/year=")
-    |> Enum.filter(fn key ->
-      filename = Path.basename(key)
-
-      filename == "heartbeats.parquet" or
-        (String.starts_with?(filename, "raw-") and String.ends_with?(filename, ".parquet"))
-    end)
-  end
-
-  defp raw_fragment_keys(request, bucket) do
-    request
-    |> parquet_part_keys(bucket)
-    |> Enum.filter(&(Path.basename(&1) |> String.starts_with?("raw-")))
-  end
-
-  defp parquet_paths(bucket, keys) do
-    paths = Enum.map_join(keys, ", ", &sql_quote("s3://#{bucket}/#{&1}"))
-    "[#{paths}]"
-  end
-
-  defp seed_legacy!(duck, bucket) do
-    W3.Duck.query(
-      duck,
-      """
-      COPY (
-        SELECT
-          TIMESTAMPTZ '2025-06-15 12:00:00+00' AS time,
-          'synthetic/existing.ex'::VARCHAR AS entity,
-          'file'::VARCHAR AS type,
-          'coding'::VARCHAR AS category,
-          'synthetic'::VARCHAR AS project,
-          'main'::VARCHAR AS branch,
-          'Elixir'::VARCHAR AS language,
-          NULL::VARCHAR[] AS dependencies,
-          4::BIGINT AS lines,
-          1::BIGINT AS lineno,
-          1::BIGINT AS cursorpos,
-          false::BOOLEAN AS is_write,
-          'vscode/1.68.0-insider'::VARCHAR AS editor,
-          'darwin-21.4.0-arm64'::VARCHAR AS operating_system,
-          'synthetic-machine'::VARCHAR AS machine_name,
-          'ignored'::VARCHAR AS legacy_extra
-      ) TO 's3://#{bucket}/v1/year=2025/heartbeats.parquet' (
-        FORMAT PARQUET,
-        PARQUET_VERSION V2,
-        COMPRESSION ZSTD
-      )
-      """
-    )
+    assert log =~ "heartbeat compaction failed"
+    assert log =~ missing_bucket
+    assert log =~ "status: 404"
+    assert log =~ "NoSuchBucket"
   end
 
   defp heartbeat(options) do
-    Help.heartbeat(options)
-    |> Map.put("project", "synthetic")
-    |> Map.put("dependencies", nil)
-    |> Map.put("machine_name", "synthetic-machine")
-    |> Map.put("user_agent", @user_agent)
-  end
+    defaults = %{
+      "dependencies" => nil,
+      "machine_name" => "synthetic-machine",
+      "project" => "synthetic",
+      "user_agent" => @user_agent
+    }
 
-  defp invalid_heartbeat do
-    heartbeat(entity: "synthetic/failure.ex")
-    |> Map.put("time", "not-a-number")
+    overrides = Map.new(options, fn {key, value} -> {to_string(key), value} end)
+
+    Help.heartbeat()
+    |> Map.merge(defaults)
+    |> Map.merge(overrides)
   end
 
   defp put_raw!(request, bucket, key, heartbeats) do
@@ -565,8 +339,7 @@ defmodule W3.CompactorTest do
       |> Enum.map(&[JSON.encode_to_iodata!(&1), ?\n])
       |> :zstd.compress()
 
-    assert %{status: status} = Req.put!(request, url: object_url(bucket, key), body: body)
-    assert status in 200..299
+    put_object!(request, bucket, key, body)
   end
 
   defp put_object!(request, bucket, key, body) do
@@ -587,17 +360,16 @@ defmodule W3.CompactorTest do
   end
 
   defp object_keys(request, bucket, prefix) do
-    response =
+    %{status: status, body: %{"ListBucketResult" => result}} =
       Req.get!(request,
         url: "s3://#{bucket}",
         params: %{"list-type" => "2", "prefix" => prefix}
       )
 
-    assert response.status in 200..299
+    assert status in 200..299
 
-    contents = response.body["ListBucketResult"]["Contents"] || []
-
-    contents
+    result["Contents"]
+    |> Kernel.||([])
     |> Enum.map(&Map.fetch!(&1, "Key"))
     |> Enum.sort()
   end
@@ -609,9 +381,15 @@ defmodule W3.CompactorTest do
     end
   end
 
-  defp fragment_key(raw_key, year) do
-    source_id = source_id(raw_key)
-    "v1/year=#{year}/raw-#{source_id}.parquet"
+  defp processed_key(raw_keys) do
+    id =
+      raw_keys
+      |> Enum.sort()
+      |> JSON.encode_to_iodata!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    "processed/batch-#{id}.parquet"
   end
 
   defp object_url(bucket, key) do
@@ -619,29 +397,5 @@ defmodule W3.CompactorTest do
     "s3://#{bucket}/#{key}"
   end
 
-  defp source_id(value) do
-    :sha256
-    |> :crypto.hash(value)
-    |> Base.encode16(case: :lower)
-  end
-
-  defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"
-
   defp unix_seconds(datetime), do: DateTime.to_unix(datetime, :microsecond) / 1_000_000
-
-  defp start_compactor(config, options) do
-    options =
-      options
-      |> Keyword.put_new(:backoff, %{base: 1, max: 1})
-      |> Keyword.put(:task, fn -> W3.compact!(config) end)
-
-    start_supervised!(%{
-      id: make_ref(),
-      start: {W3.Periodic, :start_link, [options]}
-    })
-  end
-
-  defp config(credentials, bucket, local_data_path) do
-    %{s3: Map.put(credentials, :bucket, bucket), data_path: local_data_path}
-  end
 end

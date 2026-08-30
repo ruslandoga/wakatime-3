@@ -26,7 +26,9 @@ RUN apk add --no-cache \
     ncurses-libs \
     openssl \
     && addgroup --system w3 \
-    && adduser --system --disabled-password --uid 999 --ingroup w3 --home /app w3
+    && adduser --system --disabled-password --uid 999 --ingroup w3 --home /app w3 \
+    && mkdir -p /data \
+    && chown w3:w3 /data
 
 WORKDIR /app
 
