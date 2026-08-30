@@ -13,24 +13,11 @@ defmodule W3 do
     end)
   end
 
-  def async_map!(enumerable, fun) do
+  def async_map!(enumerable, fun, options \\ []) do
+    options = Keyword.merge([ordered: false, timeout: to_timeout(second: 60)], options)
+
     W3.TaskSupervisor
-    |> Task.Supervisor.async_stream_nolink(
-      enumerable,
-      fun,
-      ordered: false,
-      on_timeout: :kill_task,
-      timeout: to_timeout(second: 60)
-    )
-    |> Enum.map(fn
-      {:ok, result} ->
-        result
-
-      {:exit, {reason, stacktrace}} when is_list(stacktrace) ->
-        :erlang.raise(:error, reason, stacktrace)
-
-      {:exit, reason} ->
-        exit(reason)
-    end)
+    |> Task.Supervisor.async_stream(enumerable, fun, options)
+    |> Enum.map(fn {:ok, result} -> result end)
   end
 end

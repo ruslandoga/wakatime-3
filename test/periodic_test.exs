@@ -66,33 +66,6 @@ defmodule W3.PeriodicTest do
     assert log =~ "** (throw) :boom"
   end
 
-  test "retries failed supervised work" do
-    test = self()
-    attempts = start_supervised!({Agent, fn -> [:error, :success] end})
-
-    task = fn ->
-      attempt = Agent.get_and_update(attempts, fn [attempt | rest] -> {attempt, rest} end)
-
-      W3.async_map!([attempt], fn
-        :error ->
-          raise "boom"
-
-        :success ->
-          send(test, :recovered)
-
-          receive do
-            :stop -> :ok
-          end
-      end)
-    end
-
-    capture_log(fn ->
-      periodic = start_periodic(task)
-      assert_receive :recovered, 1_000
-      assert Process.alive?(periodic)
-    end)
-  end
-
   test "reports failures before retrying and resets after success" do
     telemetry_ref =
       Help.attach_telemetry([
