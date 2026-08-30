@@ -2,8 +2,8 @@ defmodule W3.Periodic do
   @moduledoc """
   Runs a function or MFA repeatedly.
 
-  Successful runs wait for the configured interval. Exceptions retry with
-  full-jitter exponential backoff; throws and exits propagate.
+  Successful runs wait for the configured interval. Failures retry with
+  full-jitter exponential backoff.
   """
 
   @behaviour :gen_statem
@@ -39,8 +39,8 @@ defmodule W3.Periodic do
     next =
       try do
         run(task)
-      rescue
-        _exception ->
+      catch
+        _kind, _reason ->
           delay = backoff_delay(backoff, failure_count)
           schedule(delay, failure_count + 1)
       else
@@ -49,6 +49,10 @@ defmodule W3.Periodic do
       end
 
     {:keep_state_and_data, next}
+  end
+
+  def handle_event(:info, _message, _state, _data) do
+    :keep_state_and_data
   end
 
   defp schedule(delay, failure_count) do

@@ -64,7 +64,7 @@ defmodule Help do
     end)
 
     %{"Success" => [true]} =
-      quack(conn, """
+      W3.Duck.query(conn, """
       CREATE OR REPLACE SECRET secret (
         TYPE s3,
         PROVIDER config,
@@ -78,10 +78,6 @@ defmodule Help do
       """)
 
     conn
-  end
-
-  def quack(conn, sql) do
-    W3.Duck.query(conn, sql)
   end
 
   def attach_telemetry(events) do

@@ -52,6 +52,89 @@ defmodule W3.PeriodicTest do
              )
   end
 
+  test "backs off after errors, exits, and throws" do
+    test = self()
+    attempts = start_supervised!({Agent, fn -> [:error, :exit, :throw, :success] end})
+
+    periodic =
+      start_periodic(fn ->
+        attempt = Agent.get_and_update(attempts, fn [attempt | rest] -> {attempt, rest} end)
+        send(test, {:attempt, attempt})
+
+        case attempt do
+          :error ->
+            raise "boom"
+
+          :exit ->
+            exit(:boom)
+
+          :throw ->
+            throw(:boom)
+
+          :success ->
+            receive do
+              :stop -> :ok
+            end
+        end
+      end)
+
+    for attempt <- [:error, :exit, :throw, :success] do
+      assert_receive {:attempt, ^attempt}, 1_000
+    end
+
+    assert Process.alive?(periodic)
+  end
+
+  test "reports failures before retrying" do
+    telemetry_ref = Help.attach_telemetry([[:w3, :periodic_test, :exception]])
+    test = self()
+    attempts = start_supervised!({Agent, fn -> [:exit, :success] end})
+
+    periodic =
+      start_periodic(fn ->
+        :telemetry.span([:w3, :periodic_test], %{source: :test}, fn ->
+          case Agent.get_and_update(attempts, fn [attempt | rest] -> {attempt, rest} end) do
+            :exit ->
+              exit(:boom)
+
+            :success ->
+              send(test, :recovered)
+
+              receive do
+                :stop -> :ok
+              end
+          end
+        end)
+      end)
+
+    assert_receive {[:w3, :periodic_test, :exception], ^telemetry_ref, %{duration: duration},
+                    %{kind: :exit, reason: :boom, source: :test, stacktrace: stacktrace}}
+
+    assert is_integer(duration)
+    assert is_list(stacktrace)
+    assert_receive :recovered, 1_000
+    assert Process.alive?(periodic)
+  end
+
+  test "ignores stray messages" do
+    test = self()
+
+    periodic =
+      start_periodic(fn ->
+        send(test, :started)
+
+        receive do
+          :continue -> :ok
+        end
+      end)
+
+    assert_receive :started, 1_000
+    send(periodic, :stray)
+    send(periodic, :continue)
+    assert_receive :started, 1_000
+    assert Process.alive?(periodic)
+  end
+
   defp start_periodic(task) do
     backoff = %{base: 1, max: 1}
 

@@ -105,7 +105,7 @@ defmodule W3.EndpointTest do
       assert key =~ ~r|\Araw/[0-9a-f]{64}\.ndjson\.zst\z|
       duck = Help.start_duck(Help.s3_credentials(:minio))
 
-      assert Help.quack(
+      assert W3.Duck.query(
                duck,
                "select * from 's3://#{bucket}/raw/*.ndjson.zst'"
              ) == %{
@@ -152,7 +152,7 @@ defmodule W3.EndpointTest do
 
       duck = Help.start_duck(Help.s3_credentials(:minio))
 
-      assert Help.quack(
+      assert W3.Duck.query(
                duck,
                """
                select project, entity, time

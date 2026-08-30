@@ -1,6 +1,7 @@
 defmodule W3.Compactor do
   @moduledoc """
-  Converts raw heartbeat objects into deterministic Parquet fragments.
+  Converts raw heartbeat objects into deterministic, year-partitioned Parquet
+  parts.
 
   Existing Parquet is deliberately not read on this hot path. Object I/O is
   handled by Req, while DuckDB only sees temporary local files.
@@ -59,45 +60,45 @@ defmodule W3.Compactor do
 
     try do
       raw_files = download!(s3, raw_keys, raw_directory, ".ndjson.zst")
-      {conversions, failures} = convert(raw_files, output_directory)
+      outputs = convert!(raw_files, output_directory)
 
-      async_map!(conversions, &commit!(s3, &1))
-      raise_first!(failures)
+      async_map!(outputs, &upload!(s3, &1))
+      Enum.each(raw_keys, &delete!(s3, &1))
+      :ok
     after
       File.rm_rf!(directory)
     end
   end
 
-  defp convert(raw_files, output_directory) do
+  defp convert!(raw_files, output_directory) do
     W3.Duck.with_duck(fn conn ->
-      raw_files
-      |> Enum.reduce({[], []}, fn raw_file, {conversions, failures} ->
-        try do
-          conversion = convert_one!(conn, raw_file, output_directory)
-          {[conversion | conversions], failures}
-        catch
-          kind, reason -> {conversions, [{kind, reason, __STACKTRACE__} | failures]}
-        end
-      end)
-      |> then(fn {conversions, failures} ->
-        {Enum.reverse(conversions), Enum.reverse(failures)}
-      end)
+      W3.Duck.query(conn, "SET threads = 1")
+
+      Enum.flat_map(raw_files, &convert_one!(conn, &1, output_directory))
     end)
   end
 
   defp convert_one!(conn, %{key: raw_key, path: raw_file}, output_directory) do
     source_id = source_id(raw_key)
-    filename = "raw-#{source_id}.parquet"
-    path = Path.join(output_directory, filename)
+    directory = Path.join(output_directory, source_id)
 
-    output =
-      if copy_raw!(conn, raw_file, path) == 0 do
-        nil
-      else
-        %{key: "v1/fragments/#{filename}", path: path}
+    if copy_raw!(conn, raw_file, directory) == 0 do
+      []
+    else
+      for "year=" <> year = partition <- File.ls!(directory) do
+        partition_directory = Path.join(directory, partition)
+
+        [filename] =
+          partition_directory
+          |> File.ls!()
+          |> Enum.filter(&String.ends_with?(&1, ".parquet"))
+
+        %{
+          key: "v1/year=#{year}/raw-#{source_id}.parquet",
+          path: Path.join(partition_directory, filename)
+        }
       end
-
-    %{raw_key: raw_key, output: output}
+    end
   end
 
   defp copy_raw!(conn, raw_file, output) do
@@ -177,6 +178,7 @@ defmodule W3.Compactor do
           ORDER BY year, time, entity
         ) TO #{sql_quote(output)} (
           FORMAT PARQUET,
+          PARTITION_BY (year),
           COMPRESSION ZSTD,
           PARQUET_VERSION V2
         );
@@ -252,11 +254,6 @@ defmodule W3.Compactor do
     :ok
   end
 
-  defp commit!(s3, %{raw_key: raw_key, output: output}) do
-    if output, do: upload!(s3, output)
-    delete!(s3, raw_key)
-  end
-
   defp delete!(s3, key) do
     %{status: 204} = Req.delete!(req(s3), url: "s3://#{s3.bucket}/#{key}")
     :ok
@@ -271,12 +268,6 @@ defmodule W3.Compactor do
       timeout: to_timeout(second: 60)
     )
     |> Enum.map(fn {:ok, result} -> result end)
-  end
-
-  defp raise_first!([]), do: :ok
-
-  defp raise_first!([{kind, reason, stacktrace} | _failures]) do
-    :erlang.raise(kind, reason, stacktrace)
   end
 
   defp source_id(raw_key) do

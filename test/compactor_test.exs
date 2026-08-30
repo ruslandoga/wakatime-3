@@ -9,14 +9,15 @@ defmodule W3.CompactorTest do
                 "vscode/1.68.0-insider vscode-wakatime/18.1.5"
 
   @tag :minio
-  test "writes one deterministic fragment per raw object without changing legacy parquet" do
+  test "writes deterministic year parts for each raw object without changing legacy parquet" do
     credentials = Help.s3_credentials(:minio)
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-#{suffix}"
     first_raw_key = "raw/first.ndjson.zst"
     second_raw_key = "raw/second.ndjson.zst"
-    first_fragment_key = fragment_key(first_raw_key)
-    second_fragment_key = fragment_key(second_raw_key)
+    first_2025_fragment_key = fragment_key(first_raw_key, 2025)
+    first_2026_fragment_key = fragment_key(first_raw_key, 2026)
+    second_fragment_key = fragment_key(second_raw_key, 2025)
     legacy_key = "v1/year=2025/heartbeats.parquet"
 
     :ok = Help.create_bucket(credentials, bucket)
@@ -62,6 +63,11 @@ defmodule W3.CompactorTest do
         entity: "synthetic/late.ex",
         is_write: true
       )
+      |> Map.merge(%{
+        "project" => "<<LAST_PROJECT>>",
+        "branch" => "<<LAST_BRANCH>>",
+        "language" => "<<LAST_LANGUAGE>>"
+      })
 
     put_raw!(request, bucket, first_raw_key, [first, late])
     put_raw!(request, bucket, second_raw_key, [new, variant])
@@ -96,7 +102,12 @@ defmodule W3.CompactorTest do
     assert object_body(request, bucket, legacy_key) == legacy_body
 
     assert object_keys(request, bucket, "v1/") ==
-             Enum.sort([first_fragment_key, second_fragment_key, legacy_key])
+             Enum.sort([
+               first_2025_fragment_key,
+               first_2026_fragment_key,
+               second_fragment_key,
+               legacy_key
+             ])
 
     assert heartbeat_rows(duck, bucket, request) == %{
              "entity" => [
@@ -110,9 +121,9 @@ defmodule W3.CompactorTest do
              "year" => [2025, 2025, 2025, 2025, 2026]
            }
 
-    first_fragment = "s3://#{bucket}/#{first_fragment_key}"
+    first_fragment = "s3://#{bucket}/#{first_2025_fragment_key}"
 
-    assert Help.quack(
+    assert W3.Duck.query(
              duck,
              """
              SELECT
@@ -123,7 +134,7 @@ defmodule W3.CompactorTest do
              """
            ) == %{"format_version" => [2], "non_zstd" => [0]}
 
-    assert Help.quack(
+    assert W3.Duck.query(
              duck,
              "DESCRIBE SELECT * FROM read_parquet('#{first_fragment}', hive_partitioning = false)"
            )["column_name"] == [
@@ -149,11 +160,10 @@ defmodule W3.CompactorTest do
              "ai_output_tokens",
              "ai_prompt_length",
              "human_line_changes",
-             "project_root_count",
-             "year"
+             "project_root_count"
            ]
 
-    assert Help.quack(
+    assert W3.Duck.query(
              duck,
              """
              SELECT
@@ -181,21 +191,45 @@ defmodule W3.CompactorTest do
              "project_root_count" => [8]
            }
 
-    assert Help.quack(
+    assert W3.Duck.query(
              duck,
-             "SELECT entity, year FROM read_parquet('#{first_fragment}') ORDER BY year"
+             """
+             SELECT entity, year
+             FROM read_parquet(
+               #{parquet_paths(bucket, [first_2025_fragment_key, first_2026_fragment_key])},
+               hive_partitioning = true
+             )
+             ORDER BY year
+             """
            ) == %{
              "entity" => ["synthetic/first.ex", "synthetic/late.ex"],
              "year" => [2025, 2026]
            }
 
-    # Replaying an object overwrites its deterministic fragment instead of creating another one.
+    assert W3.Duck.query(
+             duck,
+             """
+             SELECT project, branch, language
+             FROM read_parquet('s3://#{bucket}/#{first_2026_fragment_key}')
+             """
+           ) == %{
+             "project" => ["<<LAST_PROJECT>>"],
+             "branch" => ["<<LAST_BRANCH>>"],
+             "language" => ["<<LAST_LANGUAGE>>"]
+           }
+
+    # Replaying an object overwrites its deterministic year parts instead of creating new ones.
     put_raw!(request, bucket, first_raw_key, [first, late])
     assert :ok = Compactor.compact!(config(credentials, bucket))
     assert object_status(request, bucket, first_raw_key) == 404
 
     assert object_keys(request, bucket, "v1/") ==
-             Enum.sort([first_fragment_key, second_fragment_key, legacy_key])
+             Enum.sort([
+               first_2025_fragment_key,
+               first_2026_fragment_key,
+               second_fragment_key,
+               legacy_key
+             ])
 
     assert object_body(request, bucket, legacy_key) == legacy_body
 
@@ -235,8 +269,10 @@ defmodule W3.CompactorTest do
     credentials = Help.s3_credentials(:minio)
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-invalid-#{suffix}"
-    raw_key = "raw/invalid.ndjson.zst"
-    fragment_key = fragment_key(raw_key)
+    invalid_raw_key = "raw/invalid.ndjson.zst"
+    valid_raw_key = "raw/valid.ndjson.zst"
+    invalid_fragment_key = fragment_key(invalid_raw_key, 2022)
+    valid_fragment_key = fragment_key(valid_raw_key, 2022)
 
     invalid_heartbeats =
       Enum.map(~w(time entity type machine_name), fn field ->
@@ -247,21 +283,21 @@ defmodule W3.CompactorTest do
     :ok = Help.create_bucket(credentials, bucket)
     request = Help.s3_req(credentials)
     duck = Help.start_duck(credentials)
-    put_raw!(request, bucket, raw_key, invalid_heartbeats)
+    put_raw!(request, bucket, invalid_raw_key, invalid_heartbeats)
 
     on_exit(fn -> delete_objects!(request, bucket) end)
 
     assert :ok = Compactor.compact!(config(credentials, bucket))
-    assert object_status(request, bucket, raw_key) == 404
-    assert object_status(request, bucket, fragment_key) == 404
+    assert object_status(request, bucket, invalid_raw_key) == 404
+    assert object_status(request, bucket, invalid_fragment_key) == 404
 
-    put_raw!(request, bucket, raw_key, [
+    put_raw!(request, bucket, valid_raw_key, [
       heartbeat(entity: "synthetic/valid.ex") | invalid_heartbeats
     ])
 
     assert :ok = Compactor.compact!(config(credentials, bucket))
-    assert object_status(request, bucket, raw_key) == 404
-    assert object_status(request, bucket, fragment_key) == 200
+    assert object_status(request, bucket, valid_raw_key) == 404
+    assert object_status(request, bucket, valid_fragment_key) == 200
 
     assert fragment_rows(duck, bucket, request) == %{
              "entity" => ["synthetic/valid.ex"],
@@ -275,7 +311,7 @@ defmodule W3.CompactorTest do
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-schedule-#{suffix}"
     raw_key = "raw/scheduled.ndjson.zst"
-    fragment_key = fragment_key(raw_key)
+    fragment_key = fragment_key(raw_key, 2022)
     local_data_path = Path.join(data_path(), "w3-compact\\'#{suffix}")
 
     :ok = Help.create_bucket(credentials, bucket)
@@ -318,7 +354,7 @@ defmodule W3.CompactorTest do
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-restart-#{suffix}"
     raw_key = "raw/retry.ndjson.zst"
-    fragment_key = fragment_key(raw_key)
+    fragment_key = fragment_key(raw_key, 2022)
 
     :ok = Help.create_bucket(credentials, bucket)
     request = Help.s3_req(credentials)
@@ -393,18 +429,17 @@ defmodule W3.CompactorTest do
   end
 
   @tag :minio
-  test "a malformed object is preserved without blocking other raw objects" do
+  test "a malformed object preserves the whole raw batch for retry" do
     credentials = Help.s3_credentials(:minio)
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-failure-#{suffix}"
     raw_key = "raw/failure.ndjson.zst"
     valid_raw_key = "raw/valid.ndjson.zst"
-    valid_fragment_key = fragment_key(valid_raw_key)
+    valid_fragment_key = fragment_key(valid_raw_key, 2022)
     local_data_path = Path.join(data_path(), "w3-compact-failure-local-#{suffix}")
 
     :ok = Help.create_bucket(credentials, bucket)
     request = Help.s3_req(credentials)
-    duck = Help.start_duck(credentials)
     put_raw!(request, bucket, raw_key, [invalid_heartbeat()])
     put_raw!(request, bucket, valid_raw_key, [heartbeat(entity: "synthetic/valid.ex")])
 
@@ -437,61 +472,58 @@ defmodule W3.CompactorTest do
     assert log =~ bucket
     assert log =~ Exception.message(reason)
     assert object_status(request, bucket, raw_key) == 200
-    assert object_status(request, bucket, valid_raw_key) == 404
-    assert object_status(request, bucket, valid_fragment_key) == 200
-
-    assert fragment_rows(duck, bucket, request) == %{
-             "entity" => ["synthetic/valid.ex"],
-             "year" => [2022]
-           }
+    assert object_status(request, bucket, valid_raw_key) == 200
+    assert object_status(request, bucket, valid_fragment_key) == 404
+    assert raw_fragment_keys(request, bucket) == []
 
     refute File.exists?(Path.join(local_data_path, "w3-compactor"))
   end
 
   defp heartbeat_rows(duck, bucket, request) do
-    legacy =
-      request
-      |> object_keys(bucket, "v1/year=")
-      |> Enum.filter(&String.ends_with?(&1, "/heartbeats.parquet"))
+    parts = parquet_part_keys(request, bucket)
 
-    fragments = object_keys(request, bucket, "v1/fragments/raw-")
-
-    relations =
-      [
-        parquet_relation(bucket, legacy, true),
-        parquet_relation(bucket, fragments, false)
-      ]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.join("\nUNION ALL BY NAME\n")
-
-    Help.quack(
+    W3.Duck.query(
       duck,
       """
       SELECT year, entity, is_write
-      FROM (#{relations})
+      FROM read_parquet(
+        #{parquet_paths(bucket, parts)},
+        hive_partitioning = true,
+        union_by_name = true
+      )
       ORDER BY year, entity, is_write
       """
     )
   end
 
   defp fragment_rows(duck, bucket, request) do
-    fragments = object_keys(request, bucket, "v1/fragments/raw-")
+    fragments = raw_fragment_keys(request, bucket)
 
-    Help.quack(
+    W3.Duck.query(
       duck,
       """
       SELECT entity, year
-      FROM read_parquet(#{parquet_paths(bucket, fragments)}, hive_partitioning = false)
+      FROM read_parquet(#{parquet_paths(bucket, fragments)}, hive_partitioning = true)
       ORDER BY year, entity
       """
     )
   end
 
-  defp parquet_relation(_bucket, [], _hive_partitioning), do: nil
+  defp parquet_part_keys(request, bucket) do
+    request
+    |> object_keys(bucket, "v1/year=")
+    |> Enum.filter(fn key ->
+      filename = Path.basename(key)
 
-  defp parquet_relation(bucket, keys, hive_partitioning) do
-    "SELECT * FROM read_parquet(#{parquet_paths(bucket, keys)}, " <>
-      "hive_partitioning = #{hive_partitioning}, union_by_name = true)"
+      filename == "heartbeats.parquet" or
+        (String.starts_with?(filename, "raw-") and String.ends_with?(filename, ".parquet"))
+    end)
+  end
+
+  defp raw_fragment_keys(request, bucket) do
+    request
+    |> parquet_part_keys(bucket)
+    |> Enum.filter(&(Path.basename(&1) |> String.starts_with?("raw-")))
   end
 
   defp parquet_paths(bucket, keys) do
@@ -500,7 +532,7 @@ defmodule W3.CompactorTest do
   end
 
   defp seed_legacy!(duck, bucket) do
-    Help.quack(
+    W3.Duck.query(
       duck,
       """
       COPY (
@@ -593,9 +625,15 @@ defmodule W3.CompactorTest do
     end
   end
 
-  defp fragment_key(raw_key) do
-    source_id = :sha256 |> :crypto.hash(raw_key) |> Base.encode16(case: :lower)
-    "v1/fragments/raw-#{source_id}.parquet"
+  defp fragment_key(raw_key, year) do
+    source_id = source_id(raw_key)
+    "v1/year=#{year}/raw-#{source_id}.parquet"
+  end
+
+  defp source_id(value) do
+    :sha256
+    |> :crypto.hash(value)
+    |> Base.encode16(case: :lower)
   end
 
   defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"
