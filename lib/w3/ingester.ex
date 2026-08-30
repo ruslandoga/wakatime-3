@@ -1,6 +1,8 @@
 defmodule W3.Ingester do
   @moduledoc false
 
+  alias W3.S3
+
   def insert_heartbeats(_s3, [], _machine_name), do: :ok
 
   def insert_heartbeats(s3, heartbeats, machine_name) do
@@ -36,13 +38,13 @@ defmodule W3.Ingester do
   defp upload(s3, key, body) do
     response =
       s3
-      |> W3.S3.base_req()
+      |> S3.base_req()
       |> Req.put(
         headers: %{
           "content-encoding" => "zstd",
           "content-type" => "application/x-ndjson"
         },
-        url: W3.S3.object_url(s3, key),
+        url: S3.object_url(s3, key),
         body: body
       )
 
