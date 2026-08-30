@@ -56,7 +56,7 @@ defmodule W3.Duck do
 
         read_chunks(result, columns, [values | chunks])
 
-      _end_of_result ->
+      nil ->
         Enum.reverse(chunks)
     end
   end
