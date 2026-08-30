@@ -9,7 +9,7 @@ defmodule W3.Compactor do
   def start_link(options) do
     s3 = options |> Keyword.fetch!(:s3) |> Map.new()
     data_path = Keyword.fetch!(options, :data_path)
-    interval = Keyword.get(options, :interval, to_timeout(second: 60))
+    interval = Keyword.get(options, :interval, to_timeout(minute: 30))
 
     backoff =
       Keyword.get(
