@@ -37,6 +37,4 @@ USER w3
 ENV HOME=/app \
     LANG=C.UTF-8
 
-EXPOSE 4000
-
 CMD ["/app/bin/w3", "start"]
