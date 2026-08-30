@@ -3,15 +3,29 @@ defmodule W3.EndpointTest do
 
   @moduletag :minio
 
-  setup do
+  setup_all do
     bucket =
       "w3-ingester-test-#{System.system_time(:second)}-#{System.unique_integer([:positive])}"
 
     s3 = Help.create_s3(bucket)
+
+    {:ok, s3: s3, bucket: bucket}
+  end
+
+  setup context do
     api_key = "406fe41f-6d69-4183-a4cc-121e0c524c2b"
+
+    s3 =
+      if context[:missing_bucket],
+        do: %{context.s3 | bucket: "#{context.bucket}-missing"},
+        else: context.s3
+
     url = Help.start_endpoint(api_key: api_key, s3: s3)
     req = Req.new(base_url: url, auth: {:basic, api_key})
-    {:ok, req: req, bucket: bucket}
+
+    on_exit(fn -> delete_objects!(Help.s3_req(context.s3), context.bucket) end)
+
+    {:ok, req: req, bucket: s3.bucket}
   end
 
   describe "auth" do
@@ -166,9 +180,8 @@ defmodule W3.EndpointTest do
              }
     end
 
+    @tag :missing_bucket
     test "returns 503 when S3 rejects the upload", %{req: req, bucket: bucket} do
-      Req.delete!(Help.s3_req(Help.s3_credentials(:minio)), url: "s3://#{bucket}")
-
       telemetry_ref = Help.attach_telemetry([[:w3, :upload, :stop]])
 
       logs =
@@ -191,6 +204,15 @@ defmodule W3.EndpointTest do
       assert logs =~ "s3://#{bucket}/#{key}"
       assert logs =~ "status: 404"
       assert logs =~ "NoSuchBucket"
+    end
+  end
+
+  defp delete_objects!(request, bucket) do
+    %{status: 200, body: %{"ListBucketResult" => result}} =
+      Req.get!(request, url: "s3://#{bucket}", params: %{"list-type" => "2"})
+
+    for %{"Key" => key} <- result["Contents"] || [] do
+      %{status: 204} = Req.delete!(request, url: "s3://#{bucket}/#{key}")
     end
   end
 end

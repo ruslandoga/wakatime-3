@@ -17,18 +17,16 @@ defmodule W3.ApplicationTest do
            ]
   end
 
-  test "starts endpoint and compactor from runtime config" do
+  test "starts endpoint from runtime config" do
     children = Supervisor.which_children(W3.Supervisor)
 
     assert {W3.TaskSupervisor, tasks, :supervisor, _} =
              List.keyfind(children, W3.TaskSupervisor, 0)
 
     assert {W3.Endpoint, endpoint, :supervisor, _} = List.keyfind(children, W3.Endpoint, 0)
-    assert {W3.Compactor, compactor, :worker, _} = List.keyfind(children, W3.Compactor, 0)
 
     assert Process.alive?(tasks)
     assert {:ok, {_ip, port}} = ThousandIsland.listener_info(endpoint)
     assert is_integer(port)
-    assert Process.alive?(compactor)
   end
 end

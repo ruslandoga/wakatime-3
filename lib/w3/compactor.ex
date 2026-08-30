@@ -7,36 +7,7 @@ defmodule W3.Compactor do
   handled by Req, while DuckDB only sees temporary local files.
   """
 
-  def start_link(options) do
-    s3 = options |> Keyword.fetch!(:s3) |> Map.new()
-    data_path = Keyword.fetch!(options, :data_path)
-    interval = Keyword.get(options, :interval, to_timeout(minute: 30))
-
-    backoff =
-      Keyword.get(
-        options,
-        :backoff,
-        %{base: to_timeout(second: 1), max: to_timeout(second: 60)}
-      )
-
-    task = {__MODULE__, :compact!, [%{s3: s3, data_path: data_path}]}
-
-    W3.Periodic.start_link(interval: interval, backoff: backoff, task: task)
-  end
-
-  def child_spec(options) do
-    %{id: __MODULE__, start: {__MODULE__, :start_link, [options]}}
-  end
-
-  def compact!(%{s3: s3, data_path: data_path}) do
-    metadata = %{bucket: s3.bucket}
-
-    :telemetry.span([:w3, :compact], metadata, fn ->
-      {compact_snapshot!(s3, data_path), metadata}
-    end)
-  end
-
-  defp compact_snapshot!(s3, data_path) do
+  def compact!(s3, data_path) do
     directory = Path.join(data_path, "w3-compactor")
     File.rm_rf!(directory)
 
@@ -62,8 +33,8 @@ defmodule W3.Compactor do
       raw_files = download!(s3, raw_keys, raw_directory, ".ndjson.zst")
       outputs = convert!(raw_files, output_directory)
 
-      async_map!(outputs, &upload!(s3, &1))
-      Enum.each(raw_keys, &delete!(s3, &1))
+      W3.async_map!(outputs, &upload!(s3, &1))
+      delete_objects!(s3, raw_keys)
       :ok
     after
       File.rm_rf!(directory)
@@ -230,11 +201,11 @@ defmodule W3.Compactor do
   defp download!(s3, keys, directory, extension) do
     req = req(s3)
 
-    async_map!(
+    W3.async_map!(
       Enum.with_index(keys),
       fn {key, index} ->
         %{status: 200, body: body} =
-          Req.get!(req, url: "s3://#{s3.bucket}/#{key}", raw: true)
+          Req.get!(req, url: object_url(s3, key), raw: true)
 
         path = Path.join(directory, "#{index}#{extension}")
         File.write!(path, body)
@@ -246,7 +217,7 @@ defmodule W3.Compactor do
   defp upload!(s3, %{key: key, path: path}) do
     %{status: 200} =
       Req.put!(req(s3),
-        url: "s3://#{s3.bucket}/#{key}",
+        url: object_url(s3, key),
         headers: %{"content-type" => "application/vnd.apache.parquet"},
         body: File.read!(path)
       )
@@ -254,26 +225,52 @@ defmodule W3.Compactor do
     :ok
   end
 
-  defp delete!(s3, key) do
-    %{status: 204} = Req.delete!(req(s3), url: "s3://#{s3.bucket}/#{key}")
-    :ok
-  end
+  defp delete_objects!(s3, keys) do
+    Enum.each(Enum.chunk_every(keys, 1_000), fn keys ->
+      body =
+        IO.iodata_to_binary([
+          ~s|<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">|,
+          Enum.map(keys, fn key ->
+            ["<Object><Key>", xml_escape(key), "</Key></Object>"]
+          end),
+          "<Quiet>true</Quiet></Delete>"
+        ])
 
-  defp async_map!(enumerable, fun) do
-    W3.TaskSupervisor
-    |> Task.Supervisor.async_stream(
-      enumerable,
-      fun,
-      ordered: false,
-      timeout: to_timeout(second: 60)
-    )
-    |> Enum.map(fn {:ok, result} -> result end)
+      %{status: 200, body: response_body} =
+        Req.post!(req(s3),
+          url: "s3://#{s3.bucket}",
+          params: [delete: ""],
+          retry: false,
+          headers: %{
+            "content-md5" => :md5 |> :crypto.hash(body) |> Base.encode64(),
+            "content-type" => "application/xml"
+          },
+          body: body
+        )
+
+      case ReqS3.XML.parse_s3(response_body) do
+        %{"DeleteResult" => nil} -> :ok
+        %{"DeleteResult" => result} -> nil = result["Error"]
+      end
+    end)
   end
 
   defp source_id(raw_key) do
     :sha256
     |> :crypto.hash(raw_key)
     |> Base.encode16(case: :lower)
+  end
+
+  defp object_url(s3, key) do
+    key = URI.encode(key, &(&1 == ?/ or URI.char_unreserved?(&1)))
+    "s3://#{s3.bucket}/#{key}"
+  end
+
+  defp xml_escape(value) do
+    value
+    |> Plug.HTML.html_escape()
+    |> String.replace("\r", "&#13;")
+    |> String.replace("\n", "&#10;")
   end
 
   defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"

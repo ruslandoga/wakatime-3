@@ -3,29 +3,44 @@ defmodule W3.CompactorTest do
 
   import ExUnit.CaptureLog
 
-  alias W3.Compactor
+  @moduletag :minio
+  @moduletag :tmp_dir
 
   @user_agent "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 " <>
                 "vscode/1.68.0-insider vscode-wakatime/18.1.5"
 
-  @tag :minio
-  test "writes deterministic year parts for each raw object without changing legacy parquet" do
+  setup_all do
     credentials = Help.s3_credentials(:minio)
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-#{suffix}"
+
+    :ok = Help.create_bucket(credentials, bucket)
+
+    {:ok, credentials: credentials, bucket: bucket}
+  end
+
+  setup %{credentials: credentials, bucket: bucket} do
+    request = Help.s3_req(credentials)
+    duck = Help.start_duck(credentials)
+
+    on_exit(fn -> delete_objects!(request, bucket) end)
+
+    {:ok, request: request, duck: duck}
+  end
+
+  test "writes deterministic year parts for each raw object without changing legacy parquet", %{
+    credentials: credentials,
+    bucket: bucket,
+    request: request,
+    duck: duck,
+    tmp_dir: tmp_dir
+  } do
     first_raw_key = "raw/first.ndjson.zst"
-    second_raw_key = "raw/second.ndjson.zst"
+    second_raw_key = "raw/second\r.ndjson.zst"
     first_2025_fragment_key = fragment_key(first_raw_key, 2025)
     first_2026_fragment_key = fragment_key(first_raw_key, 2026)
     second_fragment_key = fragment_key(second_raw_key, 2025)
     legacy_key = "v1/year=2025/heartbeats.parquet"
-
-    :ok = Help.create_bucket(credentials, bucket)
-
-    duck = Help.start_duck(credentials)
-    request = Help.s3_req(credentials)
-
-    on_exit(fn -> delete_objects!(request, bucket) end)
 
     seed_legacy!(duck, bucket)
     legacy_body = object_body(request, bucket, legacy_key)
@@ -80,7 +95,7 @@ defmodule W3.CompactorTest do
 
     log =
       capture_log(fn ->
-        assert :ok = Compactor.compact!(config(credentials, bucket))
+        assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
       end)
 
     assert_receive {[:w3, :compact, :start], ^telemetry_ref,
@@ -220,7 +235,7 @@ defmodule W3.CompactorTest do
 
     # Replaying an object overwrites its deterministic year parts instead of creating new ones.
     put_raw!(request, bucket, first_raw_key, [first, late])
-    assert :ok = Compactor.compact!(config(credentials, bucket))
+    assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
     assert object_status(request, bucket, first_raw_key) == 404
 
     assert object_keys(request, bucket, "v1/") ==
@@ -233,28 +248,24 @@ defmodule W3.CompactorTest do
 
     assert object_body(request, bucket, legacy_key) == legacy_body
 
-    assert :ok = Compactor.compact!(config(credentials, bucket))
+    assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
   end
 
-  @tag :minio
-  test "does not read legacy canonical parquet" do
-    credentials = Help.s3_credentials(:minio)
-    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
-    bucket = "w3-compact-ignore-canonical-#{suffix}"
+  test "does not read legacy canonical parquet", %{
+    credentials: credentials,
+    bucket: bucket,
+    request: request,
+    duck: duck,
+    tmp_dir: tmp_dir
+  } do
     raw_key = "raw/ignores-canonical.ndjson.zst"
     legacy_key = "v1/year=1999/heartbeats.parquet"
     legacy_body = "intentionally not parquet"
 
-    :ok = Help.create_bucket(credentials, bucket)
-    request = Help.s3_req(credentials)
-    duck = Help.start_duck(credentials)
-
-    on_exit(fn -> delete_objects!(request, bucket) end)
-
     put_object!(request, bucket, legacy_key, legacy_body)
     put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/raw-only.ex")])
 
-    assert :ok = Compactor.compact!(config(credentials, bucket))
+    assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
     assert object_status(request, bucket, raw_key) == 404
     assert object_body(request, bucket, legacy_key) == legacy_body
 
@@ -264,11 +275,13 @@ defmodule W3.CompactorTest do
            }
   end
 
-  @tag :minio
-  test "drops raw heartbeats missing required fields" do
-    credentials = Help.s3_credentials(:minio)
-    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
-    bucket = "w3-compact-invalid-#{suffix}"
+  test "drops raw heartbeats missing required fields", %{
+    credentials: credentials,
+    bucket: bucket,
+    request: request,
+    duck: duck,
+    tmp_dir: tmp_dir
+  } do
     invalid_raw_key = "raw/invalid.ndjson.zst"
     valid_raw_key = "raw/valid.ndjson.zst"
     invalid_fragment_key = fragment_key(invalid_raw_key, 2022)
@@ -280,14 +293,9 @@ defmodule W3.CompactorTest do
         |> Map.delete(field)
       end)
 
-    :ok = Help.create_bucket(credentials, bucket)
-    request = Help.s3_req(credentials)
-    duck = Help.start_duck(credentials)
     put_raw!(request, bucket, invalid_raw_key, invalid_heartbeats)
 
-    on_exit(fn -> delete_objects!(request, bucket) end)
-
-    assert :ok = Compactor.compact!(config(credentials, bucket))
+    assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
     assert object_status(request, bucket, invalid_raw_key) == 404
     assert object_status(request, bucket, invalid_fragment_key) == 404
 
@@ -295,7 +303,7 @@ defmodule W3.CompactorTest do
       heartbeat(entity: "synthetic/valid.ex") | invalid_heartbeats
     ])
 
-    assert :ok = Compactor.compact!(config(credentials, bucket))
+    assert :ok = W3.compact!(config(credentials, bucket, tmp_dir))
     assert object_status(request, bucket, valid_raw_key) == 404
     assert object_status(request, bucket, valid_fragment_key) == 200
 
@@ -305,32 +313,24 @@ defmodule W3.CompactorTest do
            }
   end
 
-  @tag :minio
-  test "runs on the configured interval" do
-    credentials = Help.s3_credentials(:minio)
-    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
-    bucket = "w3-compact-schedule-#{suffix}"
+  test "runs on the configured interval", %{
+    credentials: credentials,
+    bucket: bucket,
+    request: request,
+    tmp_dir: tmp_dir
+  } do
     raw_key = "raw/scheduled.ndjson.zst"
     fragment_key = fragment_key(raw_key, 2022)
-    local_data_path = Path.join(data_path(), "w3-compact\\'#{suffix}")
+    local_data_path = Path.join(tmp_dir, "w3-compact\\'data")
 
-    :ok = Help.create_bucket(credentials, bucket)
-    request = Help.s3_req(credentials)
     put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/scheduled.ex")])
-
-    on_exit(fn ->
-      delete_objects!(request, bucket)
-      File.rm_rf(local_data_path)
-    end)
 
     telemetry_ref = Help.attach_telemetry([[:w3, :compact, :stop]])
 
     pid =
-      start_supervised!(
-        {Compactor,
-         s3: store(credentials, bucket),
-         data_path: local_data_path,
-         interval: to_timeout(millisecond: 20)}
+      start_compactor(
+        config(credentials, bucket, local_data_path),
+        interval: to_timeout(millisecond: 20)
       )
 
     assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: first_duration},
@@ -348,19 +348,16 @@ defmodule W3.CompactorTest do
     assert object_status(request, bucket, fragment_key) == 200
   end
 
-  @tag :minio
-  test "retries after a scheduled failure" do
-    credentials = Help.s3_credentials(:minio)
-    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
-    bucket = "w3-compact-restart-#{suffix}"
+  test "retries after a scheduled failure", %{
+    credentials: credentials,
+    bucket: bucket,
+    request: request,
+    tmp_dir: tmp_dir
+  } do
     raw_key = "raw/retry.ndjson.zst"
     fragment_key = fragment_key(raw_key, 2022)
 
-    :ok = Help.create_bucket(credentials, bucket)
-    request = Help.s3_req(credentials)
     put_raw!(request, bucket, raw_key, [invalid_heartbeat()])
-
-    on_exit(fn -> delete_objects!(request, bucket) end)
 
     telemetry_ref =
       Help.attach_telemetry([
@@ -371,12 +368,10 @@ defmodule W3.CompactorTest do
     log =
       capture_log(fn ->
         pid =
-          start_supervised!(
-            {Compactor,
-             s3: store(credentials, bucket),
-             data_path: data_path(),
-             backoff: %{base: 1, max: 10},
-             interval: to_timeout(millisecond: 100)}
+          start_compactor(
+            config(credentials, bucket, tmp_dir),
+            backoff: %{base: 1, max: 10},
+            interval: to_timeout(millisecond: 100)
           )
 
         assert_receive {[:w3, :compact, :exception], ^telemetry_ref, %{duration: _},
@@ -400,17 +395,18 @@ defmodule W3.CompactorTest do
     assert object_status(request, bucket, fragment_key) == 200
   end
 
-  @tag :minio
-  test "includes a failed S3 response in the error" do
-    credentials = Help.s3_credentials(:minio)
-    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
-    bucket = "w3-compact-missing-#{suffix}"
+  test "includes a failed S3 response in the error", %{
+    credentials: credentials,
+    bucket: bucket,
+    tmp_dir: tmp_dir
+  } do
+    bucket = "#{bucket}-missing"
     telemetry_ref = Help.attach_telemetry([[:w3, :compact, :exception]])
 
     log =
       capture_log(fn ->
         assert_raise MatchError, fn ->
-          Compactor.compact!(config(credentials, bucket))
+          W3.compact!(config(credentials, bucket, tmp_dir))
         end
       end)
 
@@ -428,32 +424,25 @@ defmodule W3.CompactorTest do
     assert log =~ "NoSuchBucket"
   end
 
-  @tag :minio
-  test "a malformed object preserves the whole raw batch for retry" do
-    credentials = Help.s3_credentials(:minio)
-    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
-    bucket = "w3-compact-failure-#{suffix}"
+  test "a malformed object preserves the whole raw batch for retry", %{
+    credentials: credentials,
+    bucket: bucket,
+    request: request,
+    tmp_dir: tmp_dir
+  } do
     raw_key = "raw/failure.ndjson.zst"
     valid_raw_key = "raw/valid.ndjson.zst"
     valid_fragment_key = fragment_key(valid_raw_key, 2022)
-    local_data_path = Path.join(data_path(), "w3-compact-failure-local-#{suffix}")
 
-    :ok = Help.create_bucket(credentials, bucket)
-    request = Help.s3_req(credentials)
     put_raw!(request, bucket, raw_key, [invalid_heartbeat()])
     put_raw!(request, bucket, valid_raw_key, [heartbeat(entity: "synthetic/valid.ex")])
-
-    on_exit(fn ->
-      delete_objects!(request, bucket)
-      File.rm_rf(local_data_path)
-    end)
 
     telemetry_ref = Help.attach_telemetry([[:w3, :compact, :exception]])
 
     log =
       capture_log(fn ->
         assert_raise DuckNIF.Error, fn ->
-          Compactor.compact!(config(credentials, bucket, local_data_path))
+          W3.compact!(config(credentials, bucket, tmp_dir))
         end
       end)
 
@@ -476,7 +465,7 @@ defmodule W3.CompactorTest do
     assert object_status(request, bucket, valid_fragment_key) == 404
     assert raw_fragment_keys(request, bucket) == []
 
-    refute File.exists?(Path.join(local_data_path, "w3-compactor"))
+    refute File.exists?(Path.join(tmp_dir, "w3-compactor"))
   end
 
   defp heartbeat_rows(duck, bucket, request) do
@@ -581,25 +570,25 @@ defmodule W3.CompactorTest do
       |> Enum.map(&[JSON.encode_to_iodata!(&1), ?\n])
       |> :zstd.compress()
 
-    assert %{status: status} = Req.put!(request, url: "s3://#{bucket}/#{key}", body: body)
+    assert %{status: status} = Req.put!(request, url: object_url(bucket, key), body: body)
     assert status in 200..299
   end
 
   defp put_object!(request, bucket, key, body) do
-    assert %{status: status} = Req.put!(request, url: "s3://#{bucket}/#{key}", body: body)
+    assert %{status: status} = Req.put!(request, url: object_url(bucket, key), body: body)
     assert status in 200..299
   end
 
   defp object_body(request, bucket, key) do
     assert %{status: status, body: body} =
-             Req.get!(request, url: "s3://#{bucket}/#{key}", raw: true)
+             Req.get!(request, url: object_url(bucket, key), raw: true)
 
     assert status in 200..299
     IO.iodata_to_binary(body)
   end
 
   defp object_status(request, bucket, key) do
-    Req.head!(request, url: "s3://#{bucket}/#{key}").status
+    Req.head!(request, url: object_url(bucket, key)).status
   end
 
   defp object_keys(request, bucket, prefix) do
@@ -620,7 +609,7 @@ defmodule W3.CompactorTest do
 
   defp delete_objects!(request, bucket) do
     for key <- object_keys(request, bucket, "") do
-      assert %{status: status} = Req.delete!(request, url: "s3://#{bucket}/#{key}")
+      assert %{status: status} = Req.delete!(request, url: object_url(bucket, key))
       assert status in 200..299
     end
   end
@@ -628,6 +617,11 @@ defmodule W3.CompactorTest do
   defp fragment_key(raw_key, year) do
     source_id = source_id(raw_key)
     "v1/year=#{year}/raw-#{source_id}.parquet"
+  end
+
+  defp object_url(bucket, key) do
+    key = URI.encode(key, &(&1 == ?/ or URI.char_unreserved?(&1)))
+    "s3://#{bucket}/#{key}"
   end
 
   defp source_id(value) do
@@ -639,12 +633,20 @@ defmodule W3.CompactorTest do
   defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"
 
   defp unix_seconds(datetime), do: DateTime.to_unix(datetime, :microsecond) / 1_000_000
-  defp config(credentials, bucket), do: config(credentials, bucket, data_path())
 
-  defp config(credentials, bucket, local_data_path) do
-    %{s3: store(credentials, bucket), data_path: local_data_path}
+  defp start_compactor(config, options) do
+    options =
+      options
+      |> Keyword.put_new(:backoff, %{base: 1, max: 1})
+      |> Keyword.put(:task, fn -> W3.compact!(config) end)
+
+    start_supervised!(%{
+      id: make_ref(),
+      start: {W3.Periodic, :start_link, [options]}
+    })
   end
 
-  defp data_path, do: System.get_env("DATA_PATH", System.tmp_dir!())
-  defp store(credentials, bucket), do: Map.put(credentials, :bucket, bucket)
+  defp config(credentials, bucket, local_data_path) do
+    %{s3: Map.put(credentials, :bucket, bucket), data_path: local_data_path}
+  end
 end

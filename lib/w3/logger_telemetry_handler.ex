@@ -8,6 +8,7 @@ defmodule W3.LoggerTelemetryHandler do
       [
         [:w3, :compact, :stop],
         [:w3, :compact, :exception],
+        [:w3, :periodic, :exception],
         [:w3, :upload, :stop],
         [:w3, :upload, :exception],
         [:w3, :log]
@@ -30,6 +31,14 @@ defmodule W3.LoggerTelemetryHandler do
   def handle_event([:w3, :compact, :exception], measurements, metadata, _config) do
     Logger.error(fn ->
       "heartbeat compaction failed after #{duration(measurements)}ms for #{metadata.bucket}:\n" <>
+        format_error(metadata)
+    end)
+  end
+
+  def handle_event([:w3, :periodic, :exception], _measurements, metadata, _config) do
+    Logger.warning(fn ->
+      "periodic task #{metadata.task} failed on attempt #{metadata.attempt}; " <>
+        "retrying attempt #{metadata.attempt + 1} in #{metadata.retry_delay}ms:\n" <>
         format_error(metadata)
     end)
   end

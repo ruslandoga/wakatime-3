@@ -77,15 +77,16 @@ and leaves its raw objects in place for inspection or retry. Deduplication withi
 during conversion.
 
 For now the compactor uses the application's existing read/write S3 credentials and bucket. Keep the
-bucket private: do not enable `r2.dev`, a public custom domain, or browser CORS. `W3.Compactor` uses
-a supervised `W3.Periodic` state machine. Raw conversion first runs after 30 minutes, and each next run
-waits 30 minutes after the previous successful attempt finishes. Failed attempts retry with full-jitter
-exponential backoff using a one-second base and one-minute cap.
+bucket private: do not enable `r2.dev`, a public custom domain, or browser CORS. The application runs
+`W3.compact!/1` through a supervised `W3.Periodic` state machine. Raw conversion first runs after
+30 minutes, and each next run waits 30 minutes after the previous successful attempt finishes. Failed
+attempts retry with full-jitter exponential backoff using a one-second base and one-minute cap.
 Compactions emit telemetry under `[:w3, :compact]`, heartbeat uploads under `[:w3, :upload]`, and
-plugin logs under `[:w3, :log]`. All application logging is performed by a central telemetry
-handler; the endpoint, ingester, and compactor only emit events. Span logs include elapsed time;
-upload logs also include heartbeat and compressed-byte counts, while exceptions include formatted
-error details.
+periodic attempts under `[:w3, :periodic]`; plugin logs use `[:w3, :log]`. Failed periodic attempts
+emit `[:w3, :periodic, :exception]`; every periodic span includes the task name, attempt number, and
+the backoff delay that will be used if it fails. All application logging is performed by a central
+telemetry handler. Span logs include elapsed time; upload logs also include heartbeat and
+compressed-byte counts, while exceptions include formatted error details.
 
 Set `DATA_PATH` on the running container to choose the parent directory for temporary compaction
 files. It defaults to the system temporary directory; only its `w3-compactor` child is cleared.
