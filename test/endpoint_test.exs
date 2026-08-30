@@ -3,15 +3,24 @@ defmodule W3.EndpointTest do
 
   @moduletag :minio
 
-  setup do
+  setup context do
     bucket =
       "w3-ingester-test-#{System.system_time(:second)}-#{System.unique_integer([:positive])}"
 
     s3 = Help.create_s3(bucket)
     api_key = "406fe41f-6d69-4183-a4cc-121e0c524c2b"
-    url = Help.start_endpoint(api_key: api_key, s3: s3)
+
+    endpoint_s3 =
+      if context[:missing_bucket],
+        do: %{s3 | bucket: "#{bucket}-missing"},
+        else: s3
+
+    url = Help.start_endpoint(api_key: api_key, s3: endpoint_s3)
     req = Req.new(base_url: url, auth: {:basic, api_key})
-    {:ok, req: req, bucket: bucket}
+
+    on_exit(fn -> delete_objects!(Help.s3_req(s3), bucket) end)
+
+    {:ok, req: req, bucket: endpoint_s3.bucket}
   end
 
   describe "auth" do
@@ -105,7 +114,7 @@ defmodule W3.EndpointTest do
       assert key =~ ~r|\Araw/[0-9a-f]{64}\.ndjson\.zst\z|
       duck = Help.start_duck(Help.s3_credentials(:minio))
 
-      assert Help.quack(
+      assert W3.Duck.query(
                duck,
                "select * from 's3://#{bucket}/raw/*.ndjson.zst'"
              ) == %{
@@ -152,7 +161,7 @@ defmodule W3.EndpointTest do
 
       duck = Help.start_duck(Help.s3_credentials(:minio))
 
-      assert Help.quack(
+      assert W3.Duck.query(
                duck,
                """
                select project, entity, time
@@ -166,9 +175,8 @@ defmodule W3.EndpointTest do
              }
     end
 
+    @tag :missing_bucket
     test "returns 503 when S3 rejects the upload", %{req: req, bucket: bucket} do
-      Req.delete!(Help.s3_req(Help.s3_credentials(:minio)), url: "s3://#{bucket}")
-
       telemetry_ref = Help.attach_telemetry([[:w3, :upload, :stop]])
 
       logs =
@@ -182,14 +190,24 @@ defmodule W3.EndpointTest do
                       %{
                         bucket: ^bucket,
                         key: key,
-                        result: {:error, {:http_status, 404}}
+                        result: {:error, %Req.Response{status: 404}}
                       }}
 
       assert logs =~ "failed to upload 1 heartbeat(s)"
       assert logs =~ "#{bytes} compressed bytes"
       assert logs =~ "#{System.convert_time_unit(duration, :native, :millisecond)}ms"
       assert logs =~ "s3://#{bucket}/#{key}"
-      assert logs =~ "HTTP status 404"
+      assert logs =~ "status: 404"
+      assert logs =~ "NoSuchBucket"
+    end
+  end
+
+  defp delete_objects!(request, bucket) do
+    %{status: 200, body: %{"ListBucketResult" => result}} =
+      Req.get!(request, url: "s3://#{bucket}", params: %{"list-type" => "2"})
+
+    for %{"Key" => key} <- result["Contents"] || [] do
+      %{status: 204} = Req.delete!(request, url: "s3://#{bucket}/#{key}")
     end
   end
 end

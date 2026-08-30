@@ -1,41 +1,13 @@
 defmodule W3.Compactor do
   @moduledoc """
-  Merges a snapshot of raw heartbeats into the annual Parquet files.
+  Converts raw heartbeat objects into deterministic, year-partitioned Parquet
+  parts.
 
-  Object I/O is handled by Req. DuckDB only sees temporary local files, and
-  its database and connection exist only while the local merge is running.
+  Existing Parquet is deliberately not read on this hot path. Object I/O is
+  handled by Req, while DuckDB only sees temporary local files.
   """
 
-  def start_link(options) do
-    s3 = options |> Keyword.fetch!(:s3) |> Map.new()
-    data_path = Keyword.fetch!(options, :data_path)
-    interval = Keyword.get(options, :interval, to_timeout(second: 60))
-
-    backoff =
-      Keyword.get(
-        options,
-        :backoff,
-        %{base: to_timeout(second: 1), max: to_timeout(second: 60)}
-      )
-
-    task = {__MODULE__, :compact!, [%{s3: s3, data_path: data_path}]}
-
-    W3.Periodic.start_link({interval, backoff, task})
-  end
-
-  def child_spec(options) do
-    %{id: __MODULE__, start: {__MODULE__, :start_link, [options]}}
-  end
-
-  def compact!(%{s3: s3, data_path: data_path}) do
-    metadata = %{bucket: s3.bucket}
-
-    :telemetry.span([:w3, :compact], metadata, fn ->
-      {compact_snapshot!(s3, data_path), metadata}
-    end)
-  end
-
-  defp compact_snapshot!(s3, data_path) do
+  def compact!(s3, data_path) do
     directory = Path.join(data_path, "w3-compactor")
     File.rm_rf!(directory)
 
@@ -53,186 +25,139 @@ defmodule W3.Compactor do
 
   defp compact!(s3, raw_keys, directory) do
     raw_directory = Path.join(directory, "raw")
-    canonical_directory = Path.join(directory, "canonical")
     output_directory = Path.join(directory, "output")
 
-    Enum.each([raw_directory, canonical_directory, output_directory], &File.mkdir_p!/1)
+    Enum.each([raw_directory, output_directory], &File.mkdir_p!/1)
 
     try do
       raw_files = download!(s3, raw_keys, raw_directory, ".ndjson.zst")
+      outputs = convert!(raw_files, output_directory)
 
-      canonical_keys =
-        s3
-        |> list_keys("v1/year=")
-        |> Enum.filter(&String.ends_with?(&1, "/heartbeats.parquet"))
-
-      canonical_files =
-        download!(s3, canonical_keys, canonical_directory, ".parquet")
-
-      query!(raw_files, canonical_files, output_directory)
-
-      outputs =
-        for partition <- File.ls!(output_directory),
-            directory = Path.join(output_directory, partition),
-            File.dir?(directory),
-            file <- File.ls!(directory),
-            String.ends_with?(file, ".parquet") do
-          Path.join(directory, file)
-        end
-
-      Enum.each(outputs, &upload!(s3, &1))
-      Enum.each(raw_keys, &delete!(s3, &1))
+      W3.async_map!(outputs, &upload!(s3, &1))
+      delete_objects!(s3, raw_keys)
       :ok
     after
       File.rm_rf!(directory)
     end
   end
 
-  defp query!([], _canonical_files, _output_directory), do: :ok
+  defp convert!(raw_files, output_directory) do
+    W3.Duck.with_duck(fn conn ->
+      W3.Duck.query(conn, "SET threads = 1")
 
-  defp query!(raw_files, canonical_files, output_directory) do
-    database = DuckNIF.open()
+      Enum.flat_map(raw_files, &convert_one!(conn, &1, output_directory))
+    end)
+  end
 
-    try do
-      connection = DuckNIF.connect(database)
+  defp convert_one!(conn, %{key: raw_key, path: raw_file}, output_directory) do
+    source_id = source_id(raw_key)
+    directory = Path.join(output_directory, source_id)
 
-      try do
-        # The pinned DuckNIF's direct query error path releases its result before cleanup.
-        statement = DuckNIF.prepare(connection, sql(canonical_files, output_directory))
+    if copy_raw!(conn, raw_file, directory) == 0 do
+      []
+    else
+      for "year=" <> year = partition <- File.ls!(directory) do
+        partition_directory = Path.join(directory, partition)
 
-        try do
-          bind_files(statement, "raw_files", raw_files)
+        [filename] =
+          partition_directory
+          |> File.ls!()
+          |> Enum.filter(&String.ends_with?(&1, ".parquet"))
 
-          if canonical_files != [] do
-            bind_files(statement, "canonical_files", canonical_files)
-          end
-
-          result = DuckNIF.execute_prepared_dirty_io(statement)
-
-          try do
-            :ok
-          after
-            :ok = DuckNIF.destroy_result(result)
-          end
-        after
-          :ok = DuckNIF.destroy_prepare(statement)
-        end
-      after
-        :ok = DuckNIF.disconnect(connection)
+        %{
+          key: "v1/year=#{year}/raw-#{source_id}.parquet",
+          path: Path.join(partition_directory, filename)
+        }
       end
-    after
-      :ok = DuckNIF.close(database)
     end
   end
 
-  defp bind_files(statement, name, files) do
-    index = DuckNIF.bind_parameter_index(statement, name)
-    :ok = DuckNIF.bind_varchar(statement, index, JSON.encode!(files))
-  end
-
-  defp sql(canonical_files, output_directory) do
-    existing =
-      if canonical_files == [] do
-        ""
-      else
+  defp copy_raw!(conn, raw_file, output) do
+    %{"Count" => [count]} =
+      W3.Duck.query(
+        conn,
         """
-        SELECT *
-        FROM read_parquet(
-          from_json(CAST($canonical_files AS VARCHAR), '["VARCHAR"]'),
-          union_by_name = true
-        )
-        UNION ALL BY NAME
-        """
-      end
-
-    """
-    COPY (
-      WITH raw_input AS (
-        SELECT *
-        FROM read_ndjson(
-          from_json(CAST($raw_files AS VARCHAR), '["VARCHAR"]'),
-          columns = {
-            time: 'DOUBLE',
-            entity: 'VARCHAR',
-            type: 'VARCHAR',
-            category: 'VARCHAR',
-            project: 'VARCHAR',
-            branch: 'VARCHAR',
-            language: 'VARCHAR',
-            dependencies: 'VARCHAR[]',
-            lines: 'BIGINT',
-            lineno: 'BIGINT',
-            cursorpos: 'BIGINT',
-            is_write: 'BOOLEAN',
-            machine_name: 'VARCHAR',
-            timezone: 'VARCHAR',
-            user_agent: 'VARCHAR'
-          },
-          compression = 'zstd',
-          format = 'newline_delimited',
-          union_by_name = true
-        )
-      ), raw AS (
-        SELECT
-          to_timestamp(time)::TIMESTAMPTZ AS time,
-          entity::VARCHAR AS entity,
-          type::VARCHAR AS type,
-          category::VARCHAR AS category,
-          project::VARCHAR AS project,
-          branch::VARCHAR AS branch,
-          language::VARCHAR AS language,
-          dependencies::VARCHAR[] AS dependencies,
-          lines::BIGINT AS lines,
-          lineno::BIGINT AS lineno,
-          cursorpos::BIGINT AS cursorpos,
-          coalesce(is_write::BOOLEAN, false) AS is_write,
-          nullif(regexp_extract(user_agent, '(vscode/[^ ]+)', 1), '')::VARCHAR AS editor,
-          nullif(
-            regexp_extract(user_agent, '^wakatime/[^ ]+ [(]?([^ )]+)', 1),
-            ''
-          )::VARCHAR AS operating_system,
-          machine_name::VARCHAR AS machine_name,
-          timezone::VARCHAR AS timezone,
-          user_agent::VARCHAR AS user_agent
-        FROM raw_input
-      ), event AS (
-        #{existing}
-        SELECT *
-        FROM raw
+        COPY (
+          WITH raw_input AS (
+            SELECT *
+            FROM read_ndjson(
+              from_json(CAST($raw_files AS VARCHAR), '["VARCHAR"]'),
+              columns = {
+                time: 'DOUBLE',
+                entity: 'VARCHAR',
+                type: 'VARCHAR',
+                category: 'VARCHAR',
+                project: 'VARCHAR',
+                branch: 'VARCHAR',
+                language: 'VARCHAR',
+                dependencies: 'VARCHAR[]',
+                lines: 'BIGINT',
+                lineno: 'BIGINT',
+                cursorpos: 'BIGINT',
+                is_write: 'BOOLEAN',
+                machine_name: 'VARCHAR',
+                user_agent: 'VARCHAR',
+                ai_line_changes: 'BIGINT',
+                ai_cached_input_tokens: 'BIGINT',
+                ai_session: 'VARCHAR',
+                ai_subscription_plan: 'VARCHAR',
+                ai_input_tokens: 'BIGINT',
+                ai_output_tokens: 'BIGINT',
+                ai_prompt_length: 'BIGINT',
+                human_line_changes: 'BIGINT',
+                project_root_count: 'BIGINT'
+              },
+              compression = 'zstd',
+              format = 'newline_delimited',
+              union_by_name = true
+            )
+          ), event AS (
+            SELECT
+              to_timestamp(time)::TIMESTAMPTZ AS time,
+              entity::VARCHAR AS entity,
+              type::VARCHAR AS type,
+              category::VARCHAR AS category,
+              project::VARCHAR AS project,
+              branch::VARCHAR AS branch,
+              language::VARCHAR AS language,
+              dependencies::VARCHAR[] AS dependencies,
+              lines::BIGINT AS lines,
+              lineno::BIGINT AS lineno,
+              cursorpos::BIGINT AS cursorpos,
+              coalesce(is_write::BOOLEAN, false) AS is_write,
+              machine_name::VARCHAR AS machine_name,
+              max(nullif(user_agent, '')) AS user_agent,
+              ai_line_changes::BIGINT AS ai_line_changes,
+              ai_cached_input_tokens::BIGINT AS ai_cached_input_tokens,
+              ai_session::VARCHAR AS ai_session,
+              ai_subscription_plan::VARCHAR AS ai_subscription_plan,
+              ai_input_tokens::BIGINT AS ai_input_tokens,
+              ai_output_tokens::BIGINT AS ai_output_tokens,
+              ai_prompt_length::BIGINT AS ai_prompt_length,
+              human_line_changes::BIGINT AS human_line_changes,
+              project_root_count::BIGINT AS project_root_count,
+              year(timezone('UTC', to_timestamp(time)))::INTEGER AS year
+            FROM raw_input
+            WHERE time IS NOT NULL
+              AND entity IS NOT NULL
+              AND type IS NOT NULL
+              AND machine_name IS NOT NULL
+            GROUP BY ALL
+          )
+          SELECT *
+          FROM event
+          ORDER BY year, time, entity
+        ) TO #{sql_quote(output)} (
+          FORMAT PARQUET,
+          PARTITION_BY (year),
+          COMPRESSION ZSTD,
+          PARQUET_VERSION V2
+        );
+        """,
+        %{"raw_files" => JSON.encode!([raw_file])}
       )
-      SELECT
-        event.time,
-        event.entity,
-        event.type,
-        event.category,
-        event.project,
-        event.branch,
-        event.language,
-        event.dependencies,
-        event.lines,
-        event.lineno,
-        event.cursorpos,
-        event.is_write,
-        event.editor,
-        event.operating_system,
-        event.machine_name,
-        max(nullif(event.timezone, '')) AS timezone,
-        max(nullif(event.user_agent, '')) AS user_agent,
-        year(timezone('UTC', event.time))::INTEGER AS year
-      FROM event
-      WHERE event.time IS NOT NULL
-        AND event.entity IS NOT NULL
-        AND event.type IS NOT NULL
-        AND event.machine_name IS NOT NULL
-      GROUP BY ALL
-      ORDER BY year, time, entity
-    ) TO #{sql_quote(output_directory)} (
-      FORMAT PARQUET,
-      PARTITION_BY (year),
-      COMPRESSION ZSTD,
-      PARQUET_VERSION V2
-    );
-    """
+
+    count
   end
 
   defp req(s3) do
@@ -261,8 +186,8 @@ defmodule W3.Compactor do
         params
       end
 
-    response = Req.get!(req, url: "s3://#{bucket}", params: params) |> success!()
-    result = response.body["ListBucketResult"]
+    %{status: 200, body: body} = Req.get!(req, url: "s3://#{bucket}", params: params)
+    result = body["ListBucketResult"]
     page = Enum.map(result["Contents"] || [], &Map.fetch!(&1, "Key"))
     pages = [page | pages]
 
@@ -276,51 +201,76 @@ defmodule W3.Compactor do
   defp download!(s3, keys, directory, extension) do
     req = req(s3)
 
-    W3.TaskSupervisor
-    |> Task.Supervisor.async_stream_nolink(
+    W3.async_map!(
       Enum.with_index(keys),
       fn {key, index} ->
-        try do
-          response = Req.get!(req, url: "s3://#{s3.bucket}/#{key}", raw: true) |> success!()
-          path = Path.join(directory, "#{index}#{extension}")
-          File.write!(path, response.body)
-          {:ok, path}
-        catch
-          kind, reason -> {:error, kind, reason, __STACKTRACE__}
-        end
-      end,
-      ordered: false,
-      timeout: :infinity
+        %{status: 200, body: body} =
+          Req.get!(req, url: object_url(s3, key), raw: true)
+
+        path = Path.join(directory, "#{index}#{extension}")
+        File.write!(path, body)
+        %{key: key, path: path}
+      end
     )
-    |> Enum.map(fn
-      {:ok, {:ok, path}} -> path
-      {:ok, {:error, kind, reason, stacktrace}} -> :erlang.raise(kind, reason, stacktrace)
-      {:exit, reason} -> exit(reason)
+  end
+
+  defp upload!(s3, %{key: key, path: path}) do
+    %{status: 200} =
+      Req.put!(req(s3),
+        url: object_url(s3, key),
+        headers: %{"content-type" => "application/vnd.apache.parquet"},
+        body: File.read!(path)
+      )
+
+    :ok
+  end
+
+  defp delete_objects!(s3, keys) do
+    Enum.each(Enum.chunk_every(keys, 1_000), fn keys ->
+      body =
+        IO.iodata_to_binary([
+          ~s|<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">|,
+          Enum.map(keys, fn key ->
+            ["<Object><Key>", xml_escape(key), "</Key></Object>"]
+          end),
+          "<Quiet>true</Quiet></Delete>"
+        ])
+
+      %{status: 200, body: response_body} =
+        Req.post!(req(s3),
+          url: "s3://#{s3.bucket}",
+          params: [delete: ""],
+          retry: false,
+          headers: %{
+            "content-md5" => :md5 |> :crypto.hash(body) |> Base.encode64(),
+            "content-type" => "application/xml"
+          },
+          body: body
+        )
+
+      case ReqS3.XML.parse_s3(response_body) do
+        %{"DeleteResult" => nil} -> :ok
+        %{"DeleteResult" => result} -> nil = result["Error"]
+      end
     end)
   end
 
-  defp upload!(s3, path) do
-    "year=" <> year = path |> Path.dirname() |> Path.basename()
-
-    Req.put!(req(s3),
-      url: "s3://#{s3.bucket}/v1/year=#{year}/heartbeats.parquet",
-      headers: %{"content-type" => "application/vnd.apache.parquet"},
-      body: File.read!(path)
-    )
-    |> success!()
-
-    :ok
+  defp source_id(raw_key) do
+    :sha256
+    |> :crypto.hash(raw_key)
+    |> Base.encode16(case: :lower)
   end
 
-  defp delete!(s3, key) do
-    Req.delete!(req(s3), url: "s3://#{s3.bucket}/#{key}") |> success!()
-    :ok
+  defp object_url(s3, key) do
+    key = URI.encode(key, &(&1 == ?/ or URI.char_unreserved?(&1)))
+    "s3://#{s3.bucket}/#{key}"
   end
 
-  defp success!(%{status: status} = response) when status in 200..299, do: response
-
-  defp success!(response) do
-    :erlang.error({:s3_response, Map.take(response, [:status, :headers, :body])})
+  defp xml_escape(value) do
+    value
+    |> Plug.HTML.html_escape()
+    |> String.replace("\r", "&#13;")
+    |> String.replace("\n", "&#10;")
   end
 
   defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"
