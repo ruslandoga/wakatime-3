@@ -22,22 +22,25 @@ defmodule W3.Compactor do
     base_req = S3.base_req(s3)
 
     raw_paths =
-      W3.async_map!(
-        raw_keys,
-        fn key ->
+      raw_keys
+      |> Enum.map(fn key ->
+        # we can't generate random_file in async_map because it will be called in a different process and the file will be deleted when the process exits, so we generate the random_file here and pass it to async_map
+        %{key: key, path: Plug.Upload.random_file!("raw")}
+      end)
+      |> W3.async_map!(
+        fn %{key: key, path: path} ->
           %{status: 200, body: body} =
             Req.get!(base_req, url: "s3://#{s3.bucket}/#{key}", raw: true)
 
-          tmp_path = Plug.Upload.random_file!("tmp-raw-download")
-          File.write!(tmp_path, body)
-          tmp_path
+          File.write!(path, body)
+          path
         end,
         ordered: false,
         timeout: to_timeout(second: 30),
         max_concurrency: System.schedulers_online() * 4
       )
 
-    parquet_path = Plug.Upload.random_file!("tmp-raw-parquet")
+    parquet_path = Plug.Upload.random_file!("raw")
     copy_raw_to_parquet(raw_paths, parquet_path)
 
     %{status: 200} =
@@ -129,7 +132,7 @@ defmodule W3.Compactor do
         ) TO #{Duck.quote(parquet_path)} (
           FORMAT PARQUET,
           COMPRESSION ZSTD,
-          PARQUET_VERSION V2
+          PARQUET_VERSION V2,
           ROW_GROUP_SIZE 8192
         )
         """,
