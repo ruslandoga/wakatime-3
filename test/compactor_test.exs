@@ -146,6 +146,7 @@ defmodule W3.CompactorTest do
     bucket = "w3-compact-schedule-#{suffix}"
     raw_key = "raw/scheduled.ndjson.zst"
     canonical_key = "v1/year=2022/heartbeats.parquet"
+    local_data_path = Path.join(data_path(), "w3-compact\\'#{suffix}")
 
     :ok = Help.create_bucket(credentials, bucket)
     request = Help.s3_req(credentials)
@@ -154,6 +155,7 @@ defmodule W3.CompactorTest do
     on_exit(fn ->
       Req.delete(request, url: "s3://#{bucket}/#{raw_key}")
       Req.delete(request, url: "s3://#{bucket}/#{canonical_key}")
+      File.rm_rf(local_data_path)
     end)
 
     telemetry_ref = Help.attach_telemetry([[:w3, :compact, :stop]])
@@ -162,7 +164,7 @@ defmodule W3.CompactorTest do
       start_supervised!(
         {Compactor,
          s3: store(credentials, bucket),
-         data_path: data_path(),
+         data_path: local_data_path,
          interval: to_timeout(millisecond: 20)}
       )
 
@@ -233,6 +235,34 @@ defmodule W3.CompactorTest do
     assert log =~ "heartbeat compaction complete"
     assert object_status(request, bucket, raw_key) == 404
     assert object_status(request, bucket, canonical_key) == 200
+  end
+
+  @tag :minio
+  test "includes a failed S3 response in the error" do
+    credentials = Help.s3_credentials(:minio)
+    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
+    bucket = "w3-compact-missing-#{suffix}"
+    telemetry_ref = Help.attach_telemetry([[:w3, :compact, :exception]])
+
+    log =
+      capture_log(fn ->
+        assert_raise ErlangError, fn ->
+          Compactor.compact!(config(credentials, bucket))
+        end
+      end)
+
+    assert_receive {[:w3, :compact, :exception], ^telemetry_ref, _,
+                    %{
+                      bucket: ^bucket,
+                      kind: :error,
+                      reason: {:s3_response, %{status: 404, headers: headers, body: body}}
+                    }}
+
+    assert headers != %{}
+    assert body != ""
+    assert log =~ ":s3_response"
+    assert log =~ "status: 404"
+    assert log =~ "NoSuchBucket"
   end
 
   @tag :minio

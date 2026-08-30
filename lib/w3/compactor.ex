@@ -47,8 +47,8 @@ defmodule W3.Compactor do
   def handle_event(:internal, :compact, _state, data) do
     try do
       compact!(data)
-    catch
-      _kind, _reason -> :ok
+    rescue
+      _exception -> :ok
     end
 
     next = {{:timeout, :compact}, data.interval, _no_content = []}
@@ -88,17 +88,26 @@ defmodule W3.Compactor do
     Enum.each([raw_directory, canonical_directory, output_directory], &File.mkdir_p!/1)
 
     try do
-      download!(request, bucket, raw_keys, raw_directory, ".ndjson.zst")
+      raw_files = download!(request, bucket, raw_keys, raw_directory, ".ndjson.zst")
 
       canonical_keys =
         request
         |> list_keys(bucket, "v1/year=")
         |> Enum.filter(&String.ends_with?(&1, "/heartbeats.parquet"))
 
-      download!(request, bucket, canonical_keys, canonical_directory, ".parquet")
-      query!(sql(raw_directory, canonical_directory, output_directory, canonical_keys))
+      canonical_files =
+        download!(request, bucket, canonical_keys, canonical_directory, ".parquet")
 
-      outputs = Path.wildcard(Path.join(output_directory, "year=*/*.parquet"))
+      query!(sql(raw_files, canonical_files, output_directory))
+
+      outputs =
+        for partition <- File.ls!(output_directory),
+            directory = Path.join(output_directory, partition),
+            File.dir?(directory),
+            file <- File.ls!(directory),
+            String.ends_with?(file, ".parquet") do
+          Path.join(directory, file)
+        end
 
       if outputs == [] do
         raise "compaction produced no Parquet files"
@@ -141,15 +150,15 @@ defmodule W3.Compactor do
     end
   end
 
-  defp sql(raw_directory, canonical_directory, output_directory, canonical_keys) do
+  defp sql(raw_files, canonical_files, output_directory) do
     existing =
-      if canonical_keys == [] do
+      if canonical_files == [] do
         ""
       else
         """
         SELECT *
         FROM read_parquet(
-          #{sql_quote(Path.join(canonical_directory, "*.parquet"))},
+          #{sql_list(canonical_files)},
           union_by_name = true
         )
         UNION ALL
@@ -161,7 +170,7 @@ defmodule W3.Compactor do
       WITH raw_input AS (
         SELECT *
         FROM read_ndjson(
-          #{sql_quote(Path.join(raw_directory, "*.ndjson.zst"))},
+          #{sql_list(raw_files)},
           columns = {
             time: 'DOUBLE',
             entity: 'VARCHAR',
@@ -310,9 +319,11 @@ defmodule W3.Compactor do
   defp download!(request, bucket, keys, directory, extension) do
     keys
     |> Enum.with_index()
-    |> Enum.each(fn {key, index} ->
+    |> Enum.map(fn {key, index} ->
       response = Req.get!(request, url: "s3://#{bucket}/#{key}", raw: true) |> success!()
-      File.write!(Path.join(directory, "#{index}#{extension}"), response.body)
+      path = Path.join(directory, "#{index}#{extension}")
+      File.write!(path, response.body)
+      path
     end)
   end
 
@@ -335,7 +346,11 @@ defmodule W3.Compactor do
   end
 
   defp success!(%{status: status} = response) when status in 200..299, do: response
-  defp success!(%{status: status}), do: raise("S3 request failed with status #{status}")
 
+  defp success!(response) do
+    :erlang.error({:s3_response, Map.take(response, [:status, :headers, :body])})
+  end
+
+  defp sql_list(values), do: "[#{Enum.map_join(values, ", ", &sql_quote/1)}]"
   defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"
 end
