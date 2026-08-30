@@ -81,11 +81,7 @@ defmodule Help do
   end
 
   def quack(conn, sql) do
-    conn
-    |> W3.Duck.query(sql)
-    |> Enum.reduce(%{}, fn chunk, values ->
-      Map.merge(values, chunk, fn _column, left, right -> left ++ right end)
-    end)
+    W3.Duck.query(conn, sql)
   end
 
   def attach_telemetry(events) do

@@ -101,7 +101,7 @@ defmodule W3.Compactor do
   end
 
   defp copy_raw!(conn, raw_file, output) do
-    [%{"Count" => [count]}] =
+    %{"Count" => [count]} =
       W3.Duck.query(
         conn,
         """

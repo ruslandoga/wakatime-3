@@ -21,7 +21,7 @@ defmodule W3.Duck do
     end
   end
 
-  @doc "Executes a parameterized query and returns its column vectors by data chunk."
+  @doc "Executes a parameterized query and returns its column vectors."
   def query(conn, sql, params \\ %{}) when is_map(params) do
     stmt = DuckNIF.prepare(conn, sql)
 
@@ -30,7 +30,9 @@ defmodule W3.Duck do
       result = DuckNIF.execute_prepared_dirty_io(stmt)
 
       try do
-        read_chunks(result)
+        columns = columns(result)
+        values = Map.new(columns, fn {_index, name} -> {name, []} end)
+        fetch_chunks(result, columns, values)
       after
         DuckNIF.destroy_result(result)
       end
@@ -39,26 +41,24 @@ defmodule W3.Duck do
     end
   end
 
-  defp read_chunks(result) do
-    read_chunks(result, columns(result), [])
-  end
-
-  defp read_chunks(result, columns, chunks) do
+  defp fetch_chunks(result, columns, values) do
     case DuckNIF.fetch_chunk(result) do
-      chunk when is_reference(chunk) ->
+      nil ->
+        Map.new(values, fn {name, vectors} ->
+          {name, vectors |> Enum.reverse() |> Enum.flat_map(& &1)}
+        end)
+
+      chunk ->
         values =
           try do
-            Map.new(columns, fn {index, name} ->
-              {name, DuckNIF.data_chunk_get_vector(chunk, index)}
+            Enum.reduce(columns, values, fn {index, name}, values ->
+              Map.update!(values, name, &[DuckNIF.data_chunk_get_vector(chunk, index) | &1])
             end)
           after
             DuckNIF.destroy_data_chunk(chunk)
           end
 
-        read_chunks(result, columns, [values | chunks])
-
-      nil ->
-        Enum.reverse(chunks)
+        fetch_chunks(result, columns, values)
     end
   end
 
