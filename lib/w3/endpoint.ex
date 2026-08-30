@@ -5,7 +5,7 @@ defmodule W3.Endpoint do
   def start_link(options) do
     {api_key, options} = Keyword.pop!(options, :api_key)
     {s3, options} = Keyword.pop!(options, :s3)
-    Bandit.start_link([plug: {__MODULE__, %{api_key: api_key, s3: Map.new(s3)}}] ++ options)
+    Bandit.start_link([plug: {__MODULE__, %{api_key: api_key, s3: s3}}] ++ options)
   end
 
   def child_spec(options) do
@@ -17,10 +17,7 @@ defmodule W3.Endpoint do
   end
 
   def call(conn, config) do
-    %{
-      api_key: api_key,
-      s3: s3
-    } = config
+    %{api_key: api_key, s3: s3} = config
 
     conn
     |> put_private(:api_key, api_key)
@@ -109,10 +106,7 @@ defmodule W3.Endpoint do
     |> String.split("\n", trim: true)
     |> Enum.map(&JSON.decode!/1)
     |> Enum.each(fn %{"level" => level} = log ->
-      :telemetry.execute([:w3, :log], %{}, %{
-        level: String.to_existing_atom(level),
-        log: log
-      })
+      :telemetry.execute([:w3, :log], %{}, %{level: String.to_existing_atom(level), log: log})
     end)
 
     send_resp(conn, 201, [])

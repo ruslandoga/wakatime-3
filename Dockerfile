@@ -19,12 +19,12 @@ RUN mix compile && mix release
 FROM alpine:3.23.5 AS app
 
 RUN apk add --no-cache \
-        ca-certificates \
-        libgcc \
-        liblksctp \
-        libstdc++ \
-        ncurses-libs \
-        openssl \
+    ca-certificates \
+    libgcc \
+    liblksctp \
+    libstdc++ \
+    ncurses-libs \
+    openssl \
     && addgroup --system w3 \
     && adduser --system --disabled-password --uid 999 --ingroup w3 --home /app w3
 
