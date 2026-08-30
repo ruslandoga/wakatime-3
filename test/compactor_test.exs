@@ -113,6 +113,29 @@ defmodule W3.CompactorTest do
              """
            ) == %{"format_version" => [2], "non_zstd" => [0]}
 
+    assert Help.quack(
+             duck,
+             "DESCRIBE SELECT * FROM read_parquet('#{canonical_2025}', hive_partitioning = false)"
+           )["column_name"] == [
+             "time",
+             "entity",
+             "type",
+             "category",
+             "project",
+             "branch",
+             "language",
+             "dependencies",
+             "lines",
+             "lineno",
+             "cursorpos",
+             "is_write",
+             "editor",
+             "operating_system",
+             "machine_name",
+             "timezone",
+             "user_agent"
+           ]
+
     put_raw!(request, bucket, late_raw_key, [late])
     assert :ok = Compactor.compact!(config(credentials, bucket))
     assert object_status(request, bucket, late_raw_key) == 404
@@ -137,6 +160,48 @@ defmodule W3.CompactorTest do
     assert :ok = Compactor.compact!(config(credentials, bucket))
 
     refute File.exists?(Path.join(data_path(), "w3-compactor"))
+  end
+
+  @tag :minio
+  test "drops raw heartbeats missing required fields" do
+    credentials = Help.s3_credentials(:minio)
+    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
+    bucket = "w3-compact-invalid-#{suffix}"
+    raw_key = "raw/invalid.ndjson.zst"
+    canonical_key = "v1/year=2022/heartbeats.parquet"
+
+    invalid_heartbeats =
+      Enum.map(~w(time entity type machine_name), fn field ->
+        heartbeat(entity: "synthetic/invalid-#{field}.ex")
+        |> Map.delete(field)
+      end)
+
+    :ok = Help.create_bucket(credentials, bucket)
+    request = Help.s3_req(credentials)
+    duck = Help.start_duck(credentials)
+    put_raw!(request, bucket, raw_key, invalid_heartbeats)
+
+    on_exit(fn ->
+      Req.delete(request, url: "s3://#{bucket}/#{raw_key}")
+      Req.delete(request, url: "s3://#{bucket}/#{canonical_key}")
+    end)
+
+    assert :ok = Compactor.compact!(config(credentials, bucket))
+    assert object_status(request, bucket, raw_key) == 404
+    assert object_status(request, bucket, canonical_key) == 404
+
+    put_raw!(request, bucket, raw_key, [
+      heartbeat(entity: "synthetic/valid.ex") | invalid_heartbeats
+    ])
+
+    assert :ok = Compactor.compact!(config(credentials, bucket))
+    assert object_status(request, bucket, raw_key) == 404
+    assert object_status(request, bucket, canonical_key) == 200
+
+    assert Help.quack(
+             duck,
+             "SELECT entity FROM read_parquet('s3://#{bucket}/v1/year=*/heartbeats.parquet')"
+           ) == %{"entity" => ["synthetic/valid.ex"]}
   end
 
   @tag :minio
@@ -193,7 +258,7 @@ defmodule W3.CompactorTest do
 
     :ok = Help.create_bucket(credentials, bucket)
     request = Help.s3_req(credentials)
-    put_raw!(request, bucket, raw_key, [%{"entity" => "synthetic/failure.ex"}])
+    put_raw!(request, bucket, raw_key, [invalid_heartbeat()])
 
     on_exit(fn ->
       Req.delete(request, url: "s3://#{bucket}/#{raw_key}")
@@ -274,7 +339,7 @@ defmodule W3.CompactorTest do
 
     :ok = Help.create_bucket(credentials, bucket)
     request = Help.s3_req(credentials)
-    put_raw!(request, bucket, raw_key, [%{"entity" => "synthetic/failure.ex"}])
+    put_raw!(request, bucket, raw_key, [invalid_heartbeat()])
 
     on_exit(fn -> Req.delete(request, url: "s3://#{bucket}/#{raw_key}") end)
 
@@ -338,8 +403,7 @@ defmodule W3.CompactorTest do
           'vscode/1.68.0-insider'::VARCHAR AS editor,
           'darwin-21.4.0-arm64'::VARCHAR AS operating_system,
           'synthetic-machine'::VARCHAR AS machine_name,
-          NULL::VARCHAR AS timezone,
-          NULL::VARCHAR AS user_agent
+          'ignored'::VARCHAR AS legacy_extra
       ) TO 's3://#{bucket}/v1/year=2025/heartbeats.parquet' (
         FORMAT PARQUET,
         PARQUET_VERSION V2,
@@ -356,6 +420,11 @@ defmodule W3.CompactorTest do
     |> Map.put("machine_name", "synthetic-machine")
     |> Map.put("timezone", "Europe/Moscow")
     |> Map.put("user_agent", @user_agent)
+  end
+
+  defp invalid_heartbeat do
+    heartbeat(entity: "synthetic/failure.ex")
+    |> Map.put("time", "not-a-number")
   end
 
   defp put_raw!(request, bucket, key, heartbeats) do

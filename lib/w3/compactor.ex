@@ -109,10 +109,6 @@ defmodule W3.Compactor do
           Path.join(directory, file)
         end
 
-      if outputs == [] do
-        raise "compaction produced no Parquet files"
-      end
-
       Enum.each(outputs, &upload!(request, bucket, &1))
       Enum.each(raw_keys, &delete!(request, bucket, &1))
       :ok
@@ -161,7 +157,7 @@ defmodule W3.Compactor do
           #{sql_list(canonical_files)},
           union_by_name = true
         )
-        UNION ALL
+        UNION ALL BY NAME
         """
       end
 
@@ -228,20 +224,35 @@ defmodule W3.Compactor do
           timezone::VARCHAR AS timezone,
           user_agent::VARCHAR AS user_agent
         FROM raw_input
-        WHERE CASE
-          WHEN time IS NULL OR entity IS NULL OR type IS NULL OR machine_name IS NULL THEN
-            error('heartbeat is missing a required field')
-          ELSE true
-        END
       ), event AS (
         #{existing}
         SELECT *
         FROM raw
       )
       SELECT
-        event.*,
+        event.time,
+        event.entity,
+        event.type,
+        event.category,
+        event.project,
+        event.branch,
+        event.language,
+        event.dependencies,
+        event.lines,
+        event.lineno,
+        event.cursorpos,
+        event.is_write,
+        event.editor,
+        event.operating_system,
+        event.machine_name,
+        event.timezone,
+        event.user_agent,
         year(timezone('UTC', event.time))::INTEGER AS year
       FROM event
+      WHERE event.time IS NOT NULL
+        AND event.entity IS NOT NULL
+        AND event.type IS NOT NULL
+        AND event.machine_name IS NOT NULL
       QUALIFY row_number() OVER (
         PARTITION BY
           time,

@@ -61,6 +61,8 @@ Req to download that snapshot and the annual Parquet files, opens a temporary lo
 runs one merge, closes DuckDB, and uploads the same deterministic annual keys. Only after every
 upload succeeds does it delete the snapshotted raw keys. New uploads are not in the snapshot and wait
 for the next run; a failed or interrupted run safely retries because the merge deduplicates events.
+Heartbeats missing `time`, `entity`, `type`, or `machine_name` are discarded so one malformed request
+cannot block the queue; successfully processed raw objects are still deleted.
 No manifest, persistent state, dated generation, or lifecycle rule is needed.
 
 For now the compactor uses the application's existing read/write S3 credentials and bucket. Keep the
