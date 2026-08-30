@@ -279,24 +279,13 @@ defmodule W3.Compactor do
 
   defp async_map!(enumerable, fun) do
     W3.TaskSupervisor
-    |> Task.Supervisor.async_stream_nolink(
+    |> Task.Supervisor.async_stream(
       enumerable,
-      fn item ->
-        try do
-          {:ok, fun.(item)}
-        catch
-          kind, reason -> {:error, kind, reason, __STACKTRACE__}
-        end
-      end,
+      fun,
       ordered: false,
       timeout: :infinity
     )
-    |> Enum.to_list()
-    |> Enum.map(fn
-      {:ok, {:ok, result}} -> result
-      {:ok, {:error, kind, reason, stacktrace}} -> :erlang.raise(kind, reason, stacktrace)
-      {:exit, reason} -> exit(reason)
-    end)
+    |> Enum.map(fn {:ok, result} -> result end)
   end
 
   defp raise_first!([]), do: :ok
