@@ -28,7 +28,7 @@ defmodule W3.Ingester do
 
     :telemetry.span([:w3, :ingester, :upload], metadata, fn ->
       response =
-        Req.new(retry: false)
+        Req.new(retry: :transient)
         |> ReqS3.attach(
           aws_sigv4: [
             region: region,
@@ -55,9 +55,5 @@ defmodule W3.Ingester do
 
       {result, %{heartbeats: heartbeat_count}, Map.put(metadata, :result, result)}
     end)
-  rescue
-    exception -> {:error, exception}
-  catch
-    kind, reason -> {:error, {kind, reason}}
   end
 end

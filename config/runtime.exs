@@ -1,16 +1,14 @@
 import Config
 
-parse_integer = fn name, default ->
-  System.get_env(name, to_string(default))
-  |> String.to_integer()
-end
+env_file = ".#{config_env()}.env"
 
-fetch = fn key, env ->
-  System.get_env(env) || Application.get_env(:w3, key) || System.fetch_env!(env)
-end
-
-fetch_in = fn path, env ->
-  System.get_env(env) || get_in(Application.get_all_env(:w3), path) || System.fetch_env!(env)
+if File.exists?(env_file) do
+  File.read!(env_file)
+  |> String.split("\n", trim: true)
+  |> Enum.each(fn line ->
+    [key, value] = line |> String.split("=", parts: 2) |> Enum.map(&String.trim/1)
+    System.put_env(key, value)
+  end)
 end
 
 http_scheme =
@@ -21,16 +19,16 @@ http_scheme =
   end
 
 config :w3,
-  api_key: fetch.(:api_key, "API_KEY"),
+  api_key: System.fetch_env!("API_KEY"),
+  data_path: System.get_env("DATA_PATH", System.tmp_dir!()),
   http: [
     scheme: http_scheme,
-    port:
-      parse_integer.("HTTP_PORT", get_in(Application.get_all_env(:w3), [:http, :port]) || "4000")
+    port: "HTTP_PORT" |> System.get_env("4000") |> String.to_integer()
   ],
   s3: [
-    bucket: fetch_in.([:s3, :bucket], "AWS_S3_BUCKET"),
+    bucket: System.fetch_env!("AWS_S3_BUCKET"),
     region: System.get_env("AWS_REGION", "us-east-1"),
     endpoint_url: System.get_env("AWS_ENDPOINT_URL_S3", "s3.amazonaws.com"),
-    access_key_id: fetch_in.([:s3, :access_key_id], "AWS_ACCESS_KEY_ID"),
-    secret_access_key: fetch_in.([:s3, :secret_access_key], "AWS_SECRET_ACCESS_KEY")
+    access_key_id: System.fetch_env!("AWS_ACCESS_KEY_ID"),
+    secret_access_key: System.fetch_env!("AWS_SECRET_ACCESS_KEY")
   ]

@@ -117,11 +117,10 @@ defmodule W3.Endpoint do
     |> String.split("\n", trim: true)
     |> Enum.map(&JSON.decode!/1)
     |> Enum.each(fn %{"level" => level} = log ->
-      :telemetry.execute(
-        [:w3, :plugin, :log],
-        %{},
-        %{level: String.to_existing_atom(level), log: log}
-      )
+      :telemetry.execute([:w3, :plugin, :log], %{}, %{
+        level: String.to_existing_atom(level),
+        log: log
+      })
     end)
 
     send_resp(conn, 201, [])

@@ -1,6 +1,4 @@
 defmodule W3.Compactor do
-  use GenServer
-
   @moduledoc """
   Merges a snapshot of raw heartbeats into the annual Parquet files.
 
@@ -8,33 +6,50 @@ defmodule W3.Compactor do
   its database and connection exist only while the local merge is running.
   """
 
+  use GenServer
+
   def start_link(options) do
-    GenServer.start_link(__MODULE__, options, name: __MODULE__)
+    {gen_opts, args} = Keyword.split(options, [:name, :debug, :spawn_opt, :hibernate_after])
+    gen_opts = Keyword.put_new(gen_opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, args, gen_opts)
   end
 
   @impl true
   def init(options) do
     s3 = Keyword.fetch!(options, :s3)
-    send(self(), :compact)
-    {:ok, s3}
+    data_path = Keyword.fetch!(options, :data_path)
+    interval = Keyword.get(options, :interval, to_timeout(second: 60))
+
+    config = %{
+      s3: Map.new(s3),
+      data_path: data_path,
+      interval: interval,
+      timer: nil
+    }
+
+    {:ok, config, {:continue, :schedule_compaction}}
   end
 
   @impl true
-  def handle_info(:compact, s3) do
-    try do
-      run!(s3)
-    catch
-      _kind, _reason -> :ok
-    after
-      Process.send_after(self(), :compact, :timer.hours(24))
-    end
-
-    {:noreply, s3}
+  def handle_continue(:schedule_compaction, config) do
+    {:noreply, schedule_compaction(config)}
   end
 
-  def run!(s3) do
-    s3 = Map.new(s3)
-    metadata = %{bucket: Map.get(s3, :bucket)}
+  @impl true
+  def handle_info(:compact, config) do
+    compact!(config)
+    schedule_compaction(config)
+    {:noreply, config}
+  end
+
+  defp schedule_compaction(%{timer: timer, interval: interval} = config) do
+    if timer, do: Process.cancel_timer(timer)
+    timer = Process.send_after(self(), :compact, interval)
+    %{config | timer: timer}
+  end
+
+  def compact!(%{s3: s3}) do
+    metadata = %{bucket: s3.bucket}
 
     :telemetry.span([:w3, :compactor, :run], metadata, fn ->
       store!(s3)
