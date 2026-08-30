@@ -101,7 +101,7 @@ defmodule W3.Compactor do
   end
 
   defp copy_raw!(conn, raw_file, output) do
-    result =
+    [%{"Count" => [count]}] =
       W3.Duck.query(
         conn,
         """
@@ -192,10 +192,7 @@ defmodule W3.Compactor do
         %{"raw_files" => JSON.encode!([raw_file])}
       )
 
-    case for(%{"Count" => counts} <- result, count <- counts, do: count) do
-      [] -> raise "DuckDB COPY did not return a row count: #{inspect(result)}"
-      counts -> Enum.sum(counts)
-    end
+    count
   end
 
   defp req(s3) do
