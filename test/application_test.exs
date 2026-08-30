@@ -6,7 +6,6 @@ defmodule W3.ApplicationTest do
 
     assert Keyword.fetch!(config, :api_key) == "406fe41f-6d69-4183-a4cc-121e0c524c2b"
     assert Keyword.fetch!(config, :port) == 0
-    refute Keyword.fetch!(config, :start_compactor)
 
     assert Keyword.fetch!(config, :s3) == %W3.S3{
              bucket: "w3-test",
@@ -24,18 +23,19 @@ defmodule W3.ApplicationTest do
              List.keyfind(children, W3.TaskSupervisor, 0)
 
     assert {W3.Endpoint, endpoint, :supervisor, _} = List.keyfind(children, W3.Endpoint, 0)
+    assert {W3.Periodic, periodic, :worker, _} = List.keyfind(children, W3.Periodic, 0)
 
     assert Process.alive?(tasks)
+    assert Process.alive?(periodic)
     assert {:ok, {_ip, port}} = ThousandIsland.listener_info(endpoint)
     assert is_integer(port)
-    refute List.keyfind(children, W3.Periodic, 0)
   end
 
-  test "configures production compaction every 30 minutes" do
+  test "configures compaction every 30 minutes" do
     s3 = Keyword.fetch!(W3.config(), :s3)
 
     assert {W3.Periodic, options} =
-             W3.Application.children("api-key", 0, s3, true)
+             W3.Application.children("api-key", 0, s3)
              |> List.keyfind(W3.Periodic, 0)
 
     assert Keyword.fetch!(options, :interval) == to_timeout(minute: 30)
