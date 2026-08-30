@@ -69,7 +69,7 @@ defmodule W3.Compactor do
       canonical_files =
         download!(s3, canonical_keys, canonical_directory, ".parquet")
 
-      query!(sql(raw_files, canonical_files, output_directory))
+      query!(raw_files, canonical_files, output_directory)
 
       outputs =
         for partition <- File.ls!(output_directory),
@@ -88,7 +88,9 @@ defmodule W3.Compactor do
     end
   end
 
-  defp query!(sql) do
+  defp query!([], _canonical_files, _output_directory), do: :ok
+
+  defp query!(raw_files, canonical_files, output_directory) do
     database = DuckNIF.open()
 
     try do
@@ -96,9 +98,15 @@ defmodule W3.Compactor do
 
       try do
         # The pinned DuckNIF's direct query error path releases its result before cleanup.
-        statement = DuckNIF.prepare(connection, sql)
+        statement = DuckNIF.prepare(connection, sql(canonical_files, output_directory))
 
         try do
+          bind_files(statement, "raw_files", raw_files)
+
+          if canonical_files != [] do
+            bind_files(statement, "canonical_files", canonical_files)
+          end
+
           result = DuckNIF.execute_prepared_dirty_io(statement)
 
           try do
@@ -117,7 +125,12 @@ defmodule W3.Compactor do
     end
   end
 
-  defp sql(raw_files, canonical_files, output_directory) do
+  defp bind_files(statement, name, files) do
+    index = DuckNIF.bind_parameter_index(statement, name)
+    :ok = DuckNIF.bind_varchar(statement, index, JSON.encode!(files))
+  end
+
+  defp sql(canonical_files, output_directory) do
     existing =
       if canonical_files == [] do
         ""
@@ -125,7 +138,7 @@ defmodule W3.Compactor do
         """
         SELECT *
         FROM read_parquet(
-          #{sql_list(canonical_files)},
+          from_json(CAST($canonical_files AS VARCHAR), '["VARCHAR"]'),
           union_by_name = true
         )
         UNION ALL BY NAME
@@ -137,7 +150,7 @@ defmodule W3.Compactor do
       WITH raw_input AS (
         SELECT *
         FROM read_ndjson(
-          #{sql_list(raw_files)},
+          from_json(CAST($raw_files AS VARCHAR), '["VARCHAR"]'),
           columns = {
             time: 'DOUBLE',
             entity: 'VARCHAR',
@@ -173,24 +186,11 @@ defmodule W3.Compactor do
           lineno::BIGINT AS lineno,
           cursorpos::BIGINT AS cursorpos,
           coalesce(is_write::BOOLEAN, false) AS is_write,
-          list_extract(
-            list_filter(
-              string_split(trim(user_agent), ' '),
-              lambda token: starts_with(token, 'vscode/')
-            ),
-            1
-          )::VARCHAR AS editor,
-          CASE
-            WHEN starts_with(string_split(trim(user_agent), ' ')[1], 'wakatime/') THEN
-              nullif(
-                replace(
-                  replace(string_split(trim(user_agent), ' ')[2], '(', ''),
-                  ')',
-                  ''
-                ),
-                ''
-              )
-          END::VARCHAR AS operating_system,
+          nullif(regexp_extract(user_agent, '(vscode/[^ ]+)', 1), '')::VARCHAR AS editor,
+          nullif(
+            regexp_extract(user_agent, '^wakatime/[^ ]+ [(]?([^ )]+)', 1),
+            ''
+          )::VARCHAR AS operating_system,
           machine_name::VARCHAR AS machine_name,
           timezone::VARCHAR AS timezone,
           user_agent::VARCHAR AS user_agent
@@ -216,46 +216,21 @@ defmodule W3.Compactor do
         event.editor,
         event.operating_system,
         event.machine_name,
-        event.timezone,
-        event.user_agent,
+        max(nullif(event.timezone, '')) AS timezone,
+        max(nullif(event.user_agent, '')) AS user_agent,
         year(timezone('UTC', event.time))::INTEGER AS year
       FROM event
       WHERE event.time IS NOT NULL
         AND event.entity IS NOT NULL
         AND event.type IS NOT NULL
         AND event.machine_name IS NOT NULL
-      QUALIFY row_number() OVER (
-        PARTITION BY
-          time,
-          entity,
-          type,
-          category,
-          project,
-          branch,
-          language,
-          dependencies,
-          lines,
-          lineno,
-          cursorpos,
-          is_write,
-          editor,
-          operating_system,
-          machine_name
-        ORDER BY
-          (nullif(timezone, '') IS NOT NULL)::INTEGER +
-            (nullif(user_agent, '') IS NOT NULL)::INTEGER DESC,
-          timezone DESC NULLS LAST,
-          user_agent DESC NULLS LAST
-      ) = 1
+      GROUP BY ALL
       ORDER BY year, time, entity
     ) TO #{sql_quote(output_directory)} (
       FORMAT PARQUET,
       PARTITION_BY (year),
-      FILENAME_PATTERN 'heartbeats',
       COMPRESSION ZSTD,
-      COMPRESSION_LEVEL 3,
-      PARQUET_VERSION V2,
-      ROW_GROUP_SIZE 122880
+      PARQUET_VERSION V2
     );
     """
   end
@@ -301,13 +276,26 @@ defmodule W3.Compactor do
   defp download!(s3, keys, directory, extension) do
     req = req(s3)
 
-    keys
-    |> Enum.with_index()
-    |> Enum.map(fn {key, index} ->
-      response = Req.get!(req, url: "s3://#{s3.bucket}/#{key}", raw: true) |> success!()
-      path = Path.join(directory, "#{index}#{extension}")
-      File.write!(path, response.body)
-      path
+    W3.TaskSupervisor
+    |> Task.Supervisor.async_stream_nolink(
+      Enum.with_index(keys),
+      fn {key, index} ->
+        try do
+          response = Req.get!(req, url: "s3://#{s3.bucket}/#{key}", raw: true) |> success!()
+          path = Path.join(directory, "#{index}#{extension}")
+          File.write!(path, response.body)
+          {:ok, path}
+        catch
+          kind, reason -> {:error, kind, reason, __STACKTRACE__}
+        end
+      end,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.map(fn
+      {:ok, {:ok, path}} -> path
+      {:ok, {:error, kind, reason, stacktrace}} -> :erlang.raise(kind, reason, stacktrace)
+      {:exit, reason} -> exit(reason)
     end)
   end
 
@@ -335,6 +323,5 @@ defmodule W3.Compactor do
     :erlang.error({:s3_response, Map.take(response, [:status, :headers, :body])})
   end
 
-  defp sql_list(values), do: "[#{Enum.map_join(values, ", ", &sql_quote/1)}]"
   defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"
 end

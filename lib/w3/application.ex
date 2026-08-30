@@ -14,6 +14,7 @@ defmodule W3.Application do
     data_path = Keyword.fetch!(config, :data_path)
 
     children = [
+      {Task.Supervisor, name: W3.TaskSupervisor},
       {W3.Endpoint, Keyword.merge(http, api_key: api_key, s3: s3)},
       {W3.Compactor, s3: s3, data_path: data_path}
     ]
