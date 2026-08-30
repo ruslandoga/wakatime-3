@@ -129,8 +129,6 @@ WITH heartbeat AS (
     lineno,
     cursorpos,
     is_write,
-    editor,
-    operating_system,
     machine_name,
     year
   FROM heartbeat

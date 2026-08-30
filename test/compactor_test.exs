@@ -107,13 +107,6 @@ defmodule W3.CompactorTest do
                "synthetic/late.ex"
              ],
              "is_write" => [false, false, false, true, true],
-             "timezone" => [
-               nil,
-               "Europe/Moscow",
-               "Europe/Moscow",
-               "Europe/Moscow",
-               "Europe/Moscow"
-             ],
              "year" => [2025, 2025, 2025, 2025, 2026]
            }
 
@@ -146,10 +139,7 @@ defmodule W3.CompactorTest do
              "lineno",
              "cursorpos",
              "is_write",
-             "editor",
-             "operating_system",
              "machine_name",
-             "timezone",
              "user_agent",
              "ai_line_changes",
              "ai_cached_input_tokens",
@@ -477,7 +467,7 @@ defmodule W3.CompactorTest do
     Help.quack(
       duck,
       """
-      SELECT year, entity, is_write, timezone
+      SELECT year, entity, is_write
       FROM (#{relations})
       ORDER BY year, entity, is_write
       """
@@ -545,7 +535,6 @@ defmodule W3.CompactorTest do
     |> Map.put("project", "synthetic")
     |> Map.put("dependencies", nil)
     |> Map.put("machine_name", "synthetic-machine")
-    |> Map.put("timezone", "Europe/Moscow")
     |> Map.put("user_agent", @user_agent)
   end
 

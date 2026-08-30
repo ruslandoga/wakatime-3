@@ -124,7 +124,6 @@ defmodule W3.Compactor do
                 cursorpos: 'BIGINT',
                 is_write: 'BOOLEAN',
                 machine_name: 'VARCHAR',
-                timezone: 'VARCHAR',
                 user_agent: 'VARCHAR',
                 ai_line_changes: 'BIGINT',
                 ai_cached_input_tokens: 'BIGINT',
@@ -154,13 +153,7 @@ defmodule W3.Compactor do
               lineno::BIGINT AS lineno,
               cursorpos::BIGINT AS cursorpos,
               coalesce(is_write::BOOLEAN, false) AS is_write,
-              nullif(regexp_extract(user_agent, '(vscode/[^ ]+)', 1), '')::VARCHAR AS editor,
-              nullif(
-                regexp_extract(user_agent, '^wakatime/[^ ]+ [(]?([^ )]+)', 1),
-                ''
-              )::VARCHAR AS operating_system,
               machine_name::VARCHAR AS machine_name,
-              max(nullif(timezone, '')) AS timezone,
               max(nullif(user_agent, '')) AS user_agent,
               ai_line_changes::BIGINT AS ai_line_changes,
               ai_cached_input_tokens::BIGINT AS ai_cached_input_tokens,
