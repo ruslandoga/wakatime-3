@@ -13,7 +13,6 @@ end
 
 config :w3,
   api_key: System.fetch_env!("API_KEY"),
-  data_path: System.get_env("DATA_PATH", System.tmp_dir!()),
   port: "HTTP_PORT" |> System.get_env("4000") |> String.to_integer(),
   s3: %W3.S3{
     bucket: System.fetch_env!("AWS_S3_BUCKET"),

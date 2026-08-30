@@ -30,7 +30,7 @@ defmodule W3.Ingester do
   defp upload!(s3, url, body) do
     %{status: 200} =
       s3
-      |> W3.s3_req()
+      |> W3.S3.base_req()
       |> Req.put!(
         headers: %{
           "content-encoding" => "zstd",

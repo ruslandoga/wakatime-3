@@ -11,14 +11,13 @@ defmodule W3.Application do
     api_key = Keyword.fetch!(config, :api_key)
     port = Keyword.fetch!(config, :port)
     s3 = Keyword.fetch!(config, :s3)
-    data_path = Keyword.fetch!(config, :data_path)
 
     children = [
-      {Task.Supervisor, name: W3.TaskSupervisor},
+      {Task.Supervisor, name: W3.task_supervisor()},
       {W3.Endpoint, port: port, api_key: api_key, s3: s3},
       {W3.Periodic,
        interval: to_timeout(minute: 30),
-       task: fn -> W3.compact_raw_files_into_parquet(s3, data_path) end}
+       task: fn -> W3.Compactor.compact_raw_files_into_parquet(s3) end}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: W3.Supervisor)

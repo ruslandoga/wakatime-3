@@ -7,8 +7,10 @@ defmodule W3.S3 do
     end
   end
 
-  defp delete_objects!(s3, keys) do
-    Enum.each(Enum.chunk_every(keys, 1_000), fn keys ->
+  def delete_objects!(s3, keys) do
+    keys
+    |> Enum.chunk_every(1_000)
+    |> Enum.each(fn keys ->
       body =
         IO.iodata_to_binary([
           ~s|<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/">|,
@@ -19,7 +21,9 @@ defmodule W3.S3 do
         ])
 
       %{status: 200, body: response_body} =
-        Req.post!(req(s3),
+        s3
+        |> base_req()
+        |> Req.post!(
           url: "s3://#{s3.bucket}",
           params: [delete: ""],
           headers: %{
@@ -36,11 +40,6 @@ defmodule W3.S3 do
     end)
   end
 
-  defp object_url(s3, key) do
-    key = URI.encode(key, &(&1 == ?/ or URI.char_unreserved?(&1)))
-    "s3://#{s3.bucket}/#{key}"
-  end
-
   defp xml_escape(value) do
     value
     |> Plug.HTML.html_escape()
@@ -48,11 +47,11 @@ defmodule W3.S3 do
     |> String.replace("\n", "&#10;")
   end
 
-  def s3_ls(s3, prefix \\ nil) do
-    s3_ls(s3_req(s3), s3.bucket, prefix, _continuation_token = nil, _acc = [])
+  def list_objects(s3, prefix \\ nil) do
+    list_objects(base_req(s3), s3.bucket, prefix, _continuation_token = nil, _acc = [])
   end
 
-  defp s3_ls(base_req, bucket, prefix, continuation_token, acc) do
+  defp list_objects(base_req, bucket, prefix, continuation_token, acc) do
     params =
       %{"list-type" => "2"}
       |> maybe_put("prefix", prefix)
@@ -65,51 +64,13 @@ defmodule W3.S3 do
     acc = [page | acc]
 
     if result["IsTruncated"] == "true" do
-      s3_ls(base_req, bucket, prefix, Map.fetch!(result, "NextContinuationToken"), acc)
+      list_objects(base_req, bucket, prefix, Map.fetch!(result, "NextContinuationToken"), acc)
     else
       acc |> Enum.reverse() |> List.flatten()
     end
   end
 
-  def s3_download(s3, keys, dir) do
-    File.mkdir_p!(dir)
-    base_req = s3_req(s3)
-
-    keys
-    |> Enum.with_index()
-    |> W3.async_map!(
-      fn {key, idx} ->
-        %{status: 200, body: body} =
-          Req.get!(base_req, url: "s3://#{s3.bucket}/#{key}", raw: true)
-
-        path = Path.join(dir, "#{idx}.#{Path.extname(key)}")
-        File.write!(path, body)
-        %{key: key, path: path}
-      end,
-      max_concurrency: System.schedulers_online() * 2
-    )
-  end
-
-  def s3_upload(s3, files) do
-    base_req = s3_req(s3)
-
-    W3.async_map!(
-      files,
-      fn %{key: key, path: path, type: type} ->
-        %{status: 200} =
-          Req.put!(base_req,
-            url: "s3://#{s3.bucket}/#{key}",
-            headers: %{"content-type" => type},
-            body: File.read!(path)
-          )
-      end,
-      max_concurrency: System.schedulers_online() * 2
-    )
-
-    :ok
-  end
-
-  def s3_req(s3) do
+  def base_req(s3) do
     %{
       access_key_id: access_key_id,
       secret_access_key: secret_access_key,

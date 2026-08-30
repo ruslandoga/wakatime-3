@@ -24,49 +24,49 @@ defmodule W3.Periodic do
   @impl :gen_statem
   def init(options) do
     interval = Keyword.fetch!(options, :interval)
-    backoff = Keyword.fetch!(options, :backoff)
     task = Keyword.fetch!(options, :task)
-    task_name = inspect(task)
-    data = [interval: interval, backoff: backoff, task: task, task_name: task_name]
-    {:ok, :nostate, data, schedule(interval, _failure_count = 0)}
+
+    backoff =
+      Keyword.get_lazy(options, :backoff, fn ->
+        %{base: to_timeout(millisecond: 250), max: to_timeout(second: 5)}
+      end)
+
+    config = %{interval: interval, backoff: backoff, task: task}
+    next = {:next_event, :internal, {:start, _failure_count = 0}}
+
+    {:ok, :idle, config, next}
   end
 
   @impl :gen_statem
-  def handle_event({:timeout, :run}, failure_count, _state, _data) do
-    {:keep_state_and_data, {:next_event, :internal, {:run, failure_count}}}
+  def handle_event(type, content, state, data)
+
+  def handle_event({:timeout, :start}, failure_count, :idle, _config) do
+    {:keep_state_and_data, {:next_event, :internal, {:start, failure_count}}}
   end
 
-  def handle_event(:internal, {:run, failure_count}, _state, options) do
-    interval = Keyword.fetch!(options, :interval)
-    backoff = Keyword.fetch!(options, :backoff)
-    task = Keyword.fetch!(options, :task)
-    task_name = Keyword.fetch!(options, :task_name)
-    attempt = failure_count + 1
-    retry_delay = backoff_delay(backoff, failure_count)
-    metadata = %{task: task_name, attempt: attempt, retry_delay: retry_delay}
+  def handle_event(:internal, {:start, failure_count}, :idle, config) do
+    # we run it in a task to simplify resource management (memory, tmp_dir from plug.upload, etc.)
+    task = Task.Supervisor.async_nolink(W3.task_supervisor(), config.task)
+    {:next_state, {:busy, task.ref, failure_count}, config}
+  end
 
-    next =
-      try do
-        :telemetry.span([:w3, :periodic], metadata, fn ->
-          {task.(), metadata}
-        end)
-      catch
-        _kind, _reason ->
-          schedule(retry_delay, failure_count + 1)
-      else
-        _result ->
-          schedule(interval, _failure_count = 0)
-      end
+  def handle_event(:info, {task_ref, _result}, {:busy, task_ref, _failure_count}, config) do
+    Process.demonitor(task_ref, [:flush])
+    {:next_state, :idle, config, {{:timeout, :start}, config.interval, _failure_count = 0}}
+  end
 
-    {:keep_state_and_data, next}
+  def handle_event(
+        :info,
+        {:DOWN, task_ref, :process, _pid, _reason},
+        {:busy, task_ref, failure_count},
+        config
+      ) do
+    retry_delay = backoff_delay(config.backoff, failure_count)
+    {:next_state, :idle, config, {{:timeout, :start}, retry_delay, failure_count + 1}}
   end
 
   def handle_event(:info, _message, _state, _data) do
     :keep_state_and_data
-  end
-
-  defp schedule(delay, failure_count) do
-    {{:timeout, :run}, delay, failure_count}
   end
 
   defp backoff_delay(%{base: base, max: max}, failure_count) do
