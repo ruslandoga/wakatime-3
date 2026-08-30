@@ -26,10 +26,5 @@ defmodule W3.ApplicationTest do
     assert {:ok, {_ip, port}} = ThousandIsland.listener_info(endpoint)
     assert is_integer(port)
     assert Process.alive?(compactor)
-
-    assert Enum.any?(
-             :telemetry.list_handlers([:w3, :compactor, :run, :stop]),
-             &(&1.id == W3.LoggerTelemetryHandler)
-           )
   end
 end

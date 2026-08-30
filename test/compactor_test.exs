@@ -64,23 +64,28 @@ defmodule W3.CompactorTest do
 
     telemetry_ref =
       Help.attach_telemetry([
-        [:w3, :compactor, :run, :start],
-        [:w3, :compactor, :run, :stop]
+        [:w3, :compact, :start],
+        [:w3, :compact, :stop]
       ])
 
-    log = capture_log(fn -> assert :ok = Compactor.run!(store(credentials, bucket)) end)
+    log =
+      capture_log(fn ->
+        assert :ok = Compactor.compact!(config(credentials, bucket))
+      end)
 
-    assert_receive {[:w3, :compactor, :run, :start], ^telemetry_ref,
+    assert_receive {[:w3, :compact, :start], ^telemetry_ref,
                     %{monotonic_time: monotonic_time, system_time: system_time},
                     %{bucket: ^bucket}}
 
-    assert_receive {[:w3, :compactor, :run, :stop], ^telemetry_ref, %{duration: duration},
+    assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: duration},
                     %{bucket: ^bucket}}
 
     assert is_integer(monotonic_time)
     assert is_integer(system_time)
     assert is_integer(duration)
     assert log =~ "heartbeat compaction complete"
+    assert log =~ "#{System.convert_time_unit(duration, :native, :millisecond)}ms"
+    assert log =~ bucket
 
     assert object_status(request, bucket, first_raw_key) == 404
     assert object_status(request, bucket, second_raw_key) == 404
@@ -109,7 +114,7 @@ defmodule W3.CompactorTest do
            ) == %{"format_version" => [2], "non_zstd" => [0]}
 
     put_raw!(request, bucket, late_raw_key, [late])
-    assert :ok = Compactor.run!(store(credentials, bucket))
+    assert :ok = Compactor.compact!(config(credentials, bucket))
     assert object_status(request, bucket, late_raw_key) == 404
 
     assert canonical_rows(duck, canonical_glob) == %{
@@ -129,9 +134,92 @@ defmodule W3.CompactorTest do
              "year" => [2025, 2025, 2025, 2026]
            }
 
-    assert :ok = Compactor.run!(store(credentials, bucket))
+    assert :ok = Compactor.compact!(config(credentials, bucket))
 
-    refute File.exists?(Path.join(System.get_env("DATA_PATH", System.tmp_dir!()), "w3-compactor"))
+    refute File.exists?(Path.join(data_path(), "w3-compactor"))
+  end
+
+  @tag :minio
+  test "runs on the configured interval" do
+    credentials = Help.s3_credentials(:minio)
+    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
+    bucket = "w3-compact-schedule-#{suffix}"
+    raw_key = "raw/scheduled.ndjson.zst"
+    canonical_key = "v1/year=2022/heartbeats.parquet"
+
+    :ok = Help.create_bucket(credentials, bucket)
+    request = Help.s3_req(credentials)
+    put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/scheduled.ex")])
+
+    on_exit(fn ->
+      Req.delete(request, url: "s3://#{bucket}/#{raw_key}")
+      Req.delete(request, url: "s3://#{bucket}/#{canonical_key}")
+    end)
+
+    telemetry_ref = Help.attach_telemetry([[:w3, :compact, :stop]])
+
+    pid =
+      start_supervised!(
+        {Compactor,
+         s3: store(credentials, bucket),
+         data_path: data_path(),
+         interval: to_timeout(millisecond: 20)}
+      )
+
+    assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: first_duration},
+                    %{bucket: ^bucket}},
+                   1_000
+
+    assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: second_duration},
+                    %{bucket: ^bucket}},
+                   1_000
+
+    assert first_duration >= 0
+    assert second_duration >= 0
+    assert Process.alive?(pid)
+    assert object_status(request, bucket, raw_key) == 404
+    assert object_status(request, bucket, canonical_key) == 200
+  end
+
+  @tag :minio
+  test "retries after a scheduled failure" do
+    credentials = Help.s3_credentials(:minio)
+    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
+    bucket = "w3-compact-restart-#{suffix}"
+
+    telemetry_ref =
+      Help.attach_telemetry([
+        [:w3, :compact, :exception],
+        [:w3, :compact, :stop]
+      ])
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Compactor,
+             s3: store(credentials, bucket),
+             data_path: data_path(),
+             interval: to_timeout(millisecond: 100)}
+          )
+
+        assert_receive {[:w3, :compact, :exception], ^telemetry_ref, %{duration: _},
+                        %{bucket: ^bucket, reason: %RuntimeError{}}},
+                       1_000
+
+        assert Process.alive?(pid)
+
+        :ok = Help.create_bucket(credentials, bucket)
+
+        assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: _},
+                        %{bucket: ^bucket}},
+                       1_000
+
+        assert Process.alive?(pid)
+      end)
+
+    assert log =~ "heartbeat compaction failed"
+    assert log =~ "heartbeat compaction complete"
   end
 
   @tag :minio
@@ -147,29 +235,32 @@ defmodule W3.CompactorTest do
 
     on_exit(fn -> Req.delete(request, url: "s3://#{bucket}/#{raw_key}") end)
 
-    telemetry_ref = Help.attach_telemetry([[:w3, :compactor, :run, :exception]])
+    telemetry_ref = Help.attach_telemetry([[:w3, :compact, :exception]])
 
     log =
       capture_log(fn ->
         assert_raise DuckNIF.Error, fn ->
-          Compactor.run!(store(credentials, bucket))
+          Compactor.compact!(config(credentials, bucket))
         end
       end)
 
-    assert_receive {[:w3, :compactor, :run, :exception], ^telemetry_ref, %{duration: duration},
+    assert_receive {[:w3, :compact, :exception], ^telemetry_ref, %{duration: duration},
                     %{
                       bucket: ^bucket,
                       kind: :error,
-                      reason: %DuckNIF.Error{},
+                      reason: %DuckNIF.Error{} = reason,
                       stacktrace: stacktrace
                     }}
 
     assert is_integer(duration)
     assert is_list(stacktrace)
     assert log =~ "heartbeat compaction failed"
+    assert log =~ "#{System.convert_time_unit(duration, :native, :millisecond)}ms"
+    assert log =~ bucket
+    assert log =~ Exception.message(reason)
     assert object_status(request, bucket, raw_key) == 200
 
-    refute File.exists?(Path.join(System.get_env("DATA_PATH", System.tmp_dir!()), "w3-compactor"))
+    refute File.exists?(Path.join(data_path(), "w3-compactor"))
   end
 
   defp canonical_rows(duck, glob) do
@@ -239,5 +330,7 @@ defmodule W3.CompactorTest do
   end
 
   defp unix_seconds(datetime), do: DateTime.to_unix(datetime, :microsecond) / 1_000_000
+  defp config(credentials, bucket), do: %{s3: store(credentials, bucket), data_path: data_path()}
+  defp data_path, do: System.get_env("DATA_PATH", System.tmp_dir!())
   defp store(credentials, bucket), do: Map.put(credentials, :bucket, bucket)
 end

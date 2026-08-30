@@ -8,7 +8,7 @@
 
 For each incoming bulk request it:
 
-1. Adds the request's machine name and timezone to every heartbeat.
+1. Adds the request's machine name to every heartbeat.
 2. Encodes the batch as NDJSON and compresses it with zstd.
 3. Uploads it once to `raw/<sha256>.ndjson.zst`.
 4. Returns WakaTime's expected `201` response only after the object store returns 2xx.
@@ -56,7 +56,7 @@ raw/<sha256>.ndjson.zst
 v1/year=YYYY/heartbeats.parquet
 ```
 
-`W3.Compactor.run!()` lists `raw/` once and treats those exact keys as the run's generation. It uses
+Each compaction lists `raw/` once and treats those exact keys as the run's generation. It uses
 Req to download that snapshot and the annual Parquet files, opens a temporary local DuckDB database,
 runs one merge, closes DuckDB, and uploads the same deterministic annual keys. Only after every
 upload succeeds does it delete the snapshotted raw keys. New uploads are not in the snapshot and wait
@@ -65,16 +65,19 @@ No manifest, persistent state, dated generation, or lifecycle rule is needed.
 
 For now the compactor uses the application's existing read/write S3 credentials and bucket. Keep the
 bucket private: do not enable `r2.dev`, a public custom domain, or browser CORS. A supervised
-`W3.Compactor` process always starts with the application and immediately begins its first run. Each
-attempt schedules the next one 24 hours later. Runs emit telemetry under
-`[:w3, :compactor, :run]`. All application logging is performed by a central telemetry handler;
-the endpoint, ingester, and compactor only emit events.
+`W3.Compactor` state machine always starts with the application. Its first run starts after one
+minute, and the next starts one minute after each attempt finishes.
+Compactions emit telemetry under `[:w3, :compact]`, heartbeat uploads under `[:w3, :upload]`, and
+plugin logs under `[:w3, :log]`. All application logging is performed by a central telemetry
+handler; the endpoint, ingester, and compactor only emit events. Span logs include elapsed time;
+upload logs also include heartbeat and compressed-byte counts, while exceptions include formatted
+error details.
 
 Set `DATA_PATH` on the running container to choose the parent directory for temporary compaction
 files. It defaults to the system temporary directory; only its `w3-compactor` child is cleared.
 
 The database and connection are created and closed on every non-empty run, including failures; the
-GenServer retains no DuckDB handle between runs.
+state machine retains no DuckDB handle between runs.
 
 Canonical files use UTC `TIMESTAMPTZ`, Parquet V2 data pages, Zstandard compression, and 122,880-row
 groups. Routine analytics query only this dataset—not raw NDJSON:
@@ -82,7 +85,7 @@ groups. Routine analytics query only this dataset—not raw NDJSON:
 ```sql
 SELECT year, count(*) AS heartbeats
 FROM read_parquet(
-  's3://wakatimeless/v1/year=*/heartbeats.parquet',
+  's3://w3/v1/year=*/heartbeats.parquet',
   hive_partitioning = true,
   union_by_name = true
 )

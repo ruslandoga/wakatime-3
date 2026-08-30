@@ -6,15 +6,22 @@ defmodule W3.Compactor do
   its database and connection exist only while the local merge is running.
   """
 
-  use GenServer
+  @behaviour :gen_statem
 
   def start_link(options) do
-    {gen_opts, args} = Keyword.split(options, [:name, :debug, :spawn_opt, :hibernate_after])
-    gen_opts = Keyword.put_new(gen_opts, :name, __MODULE__)
-    GenServer.start_link(__MODULE__, args, gen_opts)
+    :gen_statem.start_link(__MODULE__, options, [])
   end
 
-  @impl true
+  def child_spec(options) do
+    %{id: __MODULE__, start: {__MODULE__, :start_link, [options]}}
+  end
+
+  @impl :gen_statem
+  def callback_mode do
+    :handle_event_function
+  end
+
+  @impl :gen_statem
   def init(options) do
     s3 = Keyword.fetch!(options, :s3)
     data_path = Keyword.fetch!(options, :data_path)
@@ -23,43 +30,42 @@ defmodule W3.Compactor do
     config = %{
       s3: Map.new(s3),
       data_path: data_path,
-      interval: interval,
-      timer: nil
+      interval: interval
     }
 
-    {:ok, config, {:continue, :schedule_compaction}}
+    next = {{:timeout, :compact}, interval, _no_content = []}
+    {:ok, :no_state, config, next}
   end
 
-  @impl true
-  def handle_continue(:schedule_compaction, config) do
-    {:noreply, schedule_compaction(config)}
+  @impl :gen_statem
+  def handle_event(type, content, state, data)
+
+  def handle_event({:timeout, :compact}, [], _state, _data) do
+    {:keep_state_and_data, {:next_event, :internal, :compact}}
   end
 
-  @impl true
-  def handle_info(:compact, config) do
-    compact!(config)
-    schedule_compaction(config)
-    {:noreply, config}
+  def handle_event(:internal, :compact, _state, data) do
+    try do
+      compact!(data)
+    catch
+      _kind, _reason -> :ok
+    end
+
+    next = {{:timeout, :compact}, data.interval, _no_content = []}
+    {:keep_state_and_data, next}
   end
 
-  defp schedule_compaction(%{timer: timer, interval: interval} = config) do
-    if timer, do: Process.cancel_timer(timer)
-    timer = Process.send_after(self(), :compact, interval)
-    %{config | timer: timer}
-  end
-
-  def compact!(%{s3: s3}) do
+  def compact!(%{s3: s3, data_path: data_path}) do
     metadata = %{bucket: s3.bucket}
 
-    :telemetry.span([:w3, :compactor, :run], metadata, fn ->
-      store!(s3)
-      {compact_snapshot!(s3), metadata}
+    :telemetry.span([:w3, :compact], metadata, fn ->
+      {compact_snapshot!(s3, data_path), metadata}
     end)
   end
 
-  defp compact_snapshot!(s3) do
+  defp compact_snapshot!(s3, data_path) do
     request = request(s3)
-    directory = Path.join(System.get_env("DATA_PATH", System.tmp_dir!()), "w3-compactor")
+    directory = Path.join(data_path, "w3-compactor")
     File.rm_rf!(directory)
 
     raw_keys =
@@ -325,17 +331,6 @@ defmodule W3.Compactor do
 
   defp success!(%{status: status} = response) when status in 200..299, do: response
   defp success!(%{status: status}), do: raise("S3 request failed with status #{status}")
-
-  defp store!(store) do
-    for key <- [:bucket, :region, :endpoint_url, :access_key_id, :secret_access_key] do
-      case Map.fetch(store, key) do
-        {:ok, value} when is_binary(value) and value != "" -> :ok
-        _ -> raise ArgumentError, "missing compactor store setting: #{key}"
-      end
-    end
-
-    store
-  end
 
   defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"
 end

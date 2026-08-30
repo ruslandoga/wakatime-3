@@ -5,7 +5,7 @@ defmodule W3.Endpoint do
   def start_link(options) do
     {api_key, options} = Keyword.pop!(options, :api_key)
     {s3, options} = Keyword.pop!(options, :s3)
-    Bandit.start_link([plug: {__MODULE__, %{api_key: api_key, s3: s3}}] ++ options)
+    Bandit.start_link([plug: {__MODULE__, %{api_key: api_key, s3: Map.new(s3)}}] ++ options)
   end
 
   def child_spec(options) do
@@ -84,15 +84,10 @@ defmodule W3.Endpoint do
 
   @doc false
   def handle_heartbeats(conn) do
-    %{"_json" => heartbeats} = conn.body_params
-
+    %{body_params: %{"_json" => heartbeats}, private: %{s3: s3}} = conn
     [machine_name] = get_req_header(conn, "x-machine-name")
 
-    metadata =
-      %{"machine_name" => URI.decode_www_form(machine_name)}
-      |> put_metadata("timezone", get_req_header(conn, "timezone"))
-
-    case W3.Ingester.insert_heartbeats(conn.private.s3, heartbeats, metadata) do
+    case W3.Ingester.insert_heartbeats(s3, heartbeats, URI.decode_www_form(machine_name)) do
       :ok ->
         json =
           JSON.encode_to_iodata!(%{"responses" => Enum.map(heartbeats, fn _ -> [nil, 201] end)})
@@ -106,9 +101,6 @@ defmodule W3.Endpoint do
     end
   end
 
-  defp put_metadata(metadata, _key, []), do: metadata
-  defp put_metadata(metadata, key, [value]), do: Map.put(metadata, key, value)
-
   @doc false
   def log_errors(conn) do
     %{"logs" => logs} = conn.body_params
@@ -117,7 +109,7 @@ defmodule W3.Endpoint do
     |> String.split("\n", trim: true)
     |> Enum.map(&JSON.decode!/1)
     |> Enum.each(fn %{"level" => level} = log ->
-      :telemetry.execute([:w3, :plugin, :log], %{}, %{
+      :telemetry.execute([:w3, :log], %{}, %{
         level: String.to_existing_atom(level),
         log: log
       })
