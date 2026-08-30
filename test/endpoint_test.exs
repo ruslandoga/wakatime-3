@@ -31,6 +31,8 @@ defmodule W3.EndpointTest do
   end
 
   test "logs", %{req: req} do
+    telemetry_ref = Help.attach_telemetry([[:w3, :log]])
+
     logs =
       ExUnit.CaptureLog.capture_log(fn ->
         assert %{status: 201} =
@@ -51,6 +53,15 @@ defmodule W3.EndpointTest do
                  )
       end)
 
+    assert_receive {[:w3, :log], ^telemetry_ref, %{},
+                    %{level: :debug, log: %{"message" => "some debug info"}}}
+
+    assert_receive {[:w3, :log], ^telemetry_ref, %{},
+                    %{level: :warning, log: %{"message" => "this is the last warning"}}}
+
+    assert_receive {[:w3, :log], ^telemetry_ref, %{},
+                    %{level: :error, log: %{"message" => "something's wrong"}}}
+
     assert logs =~ "some debug info"
     assert logs =~ "this is the last warning"
     assert logs =~ "something's wrong"
@@ -63,7 +74,6 @@ defmodule W3.EndpointTest do
           url: "/users/current/heartbeats.bulk",
           headers: %{
             "x-machine-name" => "mac3.local",
-            "timezone" => "Europe/Moscow",
             "content-type" => "application/json",
             "accept" => "application/json"
           }
@@ -75,14 +85,23 @@ defmodule W3.EndpointTest do
     test "ingest", %{req: req, bucket: bucket} do
       body = JSON.encode_to_iodata!([Help.heartbeat(branch: "add-ingester")])
 
-      telemetry_ref = Help.attach_telemetry([[:w3, :ingester, :upload, :stop]])
+      telemetry_ref = Help.attach_telemetry([[:w3, :upload, :stop]])
 
-      assert %{status: 201, body: %{"responses" => [[nil, 201]]}} =
-               Req.post!(req, body: body)
+      logs =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %{status: 201, body: %{"responses" => [[nil, 201]]}} =
+                   Req.post!(req, body: body)
+        end)
 
-      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _,
-                      %{bucket: ^bucket, key: key}}
+      assert_receive {[:w3, :upload, :stop], ^telemetry_ref,
+                      %{heartbeats: 1, bytes: bytes, duration: duration},
+                      %{bucket: ^bucket, key: key, result: :ok}}
 
+      assert bytes > 0
+      assert logs =~ "uploaded 1 heartbeat(s)"
+      assert logs =~ "#{bytes} compressed bytes"
+      assert logs =~ "#{System.convert_time_unit(duration, :native, :millisecond)}ms"
+      assert logs =~ "s3://#{bucket}/#{key}"
       assert key =~ ~r|\Araw/[0-9a-f]{64}\.ndjson\.zst\z|
       duck = Help.start_duck(Help.s3_credentials(:minio))
 
@@ -102,7 +121,6 @@ defmodule W3.EndpointTest do
                "machine_name" => ["mac3.local"],
                "project" => ["w1"],
                "time" => [1_653_576_917.486633],
-               "timezone" => ["Europe/Moscow"],
                "type" => ["file"],
                "user_agent" => [
                  "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 vscode/1.68.0-insider vscode-wakatime/18.1.5"
@@ -114,7 +132,7 @@ defmodule W3.EndpointTest do
       req: req,
       bucket: bucket
     } do
-      telemetry_ref = Help.attach_telemetry([[:w3, :ingester, :upload, :stop]])
+      telemetry_ref = Help.attach_telemetry([[:w3, :upload, :stop]])
 
       body1 =
         JSON.encode_to_iodata!([
@@ -127,10 +145,10 @@ defmodule W3.EndpointTest do
         ])
 
       assert %{status: 201} = Req.post!(req, body: body1)
-      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _, %{bucket: ^bucket}}
+      assert_receive {[:w3, :upload, :stop], ^telemetry_ref, _, %{bucket: ^bucket}}
 
       assert %{status: 201} = Req.post!(req, body: body2)
-      assert_receive {[:w3, :ingester, :upload, :stop], ^telemetry_ref, _, %{bucket: ^bucket}}
+      assert_receive {[:w3, :upload, :stop], ^telemetry_ref, _, %{bucket: ^bucket}}
 
       duck = Help.start_duck(Help.s3_credentials(:minio))
 
@@ -151,8 +169,27 @@ defmodule W3.EndpointTest do
     test "returns 503 when S3 rejects the upload", %{req: req, bucket: bucket} do
       Req.delete!(Help.s3_req(Help.s3_credentials(:minio)), url: "s3://#{bucket}")
 
-      assert %{status: 503, body: "service unavailable"} =
-               Req.post!(req, body: JSON.encode_to_iodata!([Help.heartbeat()]))
+      telemetry_ref = Help.attach_telemetry([[:w3, :upload, :stop]])
+
+      logs =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %{status: 503, body: "service unavailable"} =
+                   Req.post!(req, body: JSON.encode_to_iodata!([Help.heartbeat()]))
+        end)
+
+      assert_receive {[:w3, :upload, :stop], ^telemetry_ref,
+                      %{heartbeats: 1, bytes: bytes, duration: duration},
+                      %{
+                        bucket: ^bucket,
+                        key: key,
+                        result: {:error, {:http_status, 404}}
+                      }}
+
+      assert logs =~ "failed to upload 1 heartbeat(s)"
+      assert logs =~ "#{bytes} compressed bytes"
+      assert logs =~ "#{System.convert_time_unit(duration, :native, :millisecond)}ms"
+      assert logs =~ "s3://#{bucket}/#{key}"
+      assert logs =~ "HTTP status 404"
     end
   end
 end
