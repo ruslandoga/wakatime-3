@@ -283,7 +283,7 @@ defmodule W3.Compactor do
       enumerable,
       fun,
       ordered: false,
-      timeout: :infinity
+      timeout: to_timeout(second: 60)
     )
     |> Enum.map(fn {:ok, result} -> result end)
   end
