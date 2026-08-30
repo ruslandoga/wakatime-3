@@ -119,6 +119,7 @@ defmodule W3.Compactor do
       connection = DuckNIF.connect(database)
 
       try do
+        # The pinned DuckNIF's direct query error path releases its result before cleanup.
         statement = DuckNIF.prepare(connection, sql)
 
         try do
