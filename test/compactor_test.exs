@@ -9,39 +9,43 @@ defmodule W3.CompactorTest do
                 "vscode/1.68.0-insider vscode-wakatime/18.1.5"
 
   @tag :minio
-  test "merges a raw snapshot locally and deletes exactly that snapshot" do
+  test "writes one deterministic fragment per raw object without changing legacy parquet" do
     credentials = Help.s3_credentials(:minio)
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-#{suffix}"
     first_raw_key = "raw/first.ndjson.zst"
     second_raw_key = "raw/second.ndjson.zst"
-    late_raw_key = "raw/late.ndjson.zst"
+    first_fragment_key = fragment_key(first_raw_key)
+    second_fragment_key = fragment_key(second_raw_key)
+    legacy_key = "v1/year=2025/heartbeats.parquet"
 
     :ok = Help.create_bucket(credentials, bucket)
 
     duck = Help.start_duck(credentials)
     request = Help.s3_req(credentials)
 
-    on_exit(fn ->
-      for key <- [
-            first_raw_key,
-            second_raw_key,
-            late_raw_key,
-            "v1/year=2025/heartbeats.parquet",
-            "v1/year=2026/heartbeats.parquet"
-          ] do
-        Req.delete(request, url: "s3://#{bucket}/#{key}")
-      end
-    end)
+    on_exit(fn -> delete_objects!(request, bucket) end)
 
     seed_legacy!(duck, bucket)
+    legacy_body = object_body(request, bucket, legacy_key)
 
-    existing =
+    first =
       heartbeat(
         time: unix_seconds(~U[2025-06-15 12:00:00Z]),
-        entity: "synthetic/existing.ex",
+        entity: "synthetic/first.ex",
         is_write: false
       )
+      |> Map.merge(%{
+        "ai_cached_input_tokens" => 2,
+        "ai_input_tokens" => 3,
+        "ai_line_changes" => 4,
+        "ai_output_tokens" => 5,
+        "ai_prompt_length" => 6,
+        "ai_session" => "session-1",
+        "ai_subscription_plan" => "plus",
+        "human_line_changes" => 7,
+        "project_root_count" => 8
+      })
 
     new =
       heartbeat(
@@ -59,7 +63,7 @@ defmodule W3.CompactorTest do
         is_write: true
       )
 
-    put_raw!(request, bucket, first_raw_key, [existing, new])
+    put_raw!(request, bucket, first_raw_key, [first, late])
     put_raw!(request, bucket, second_raw_key, [new, variant])
 
     telemetry_ref =
@@ -89,18 +93,31 @@ defmodule W3.CompactorTest do
 
     assert object_status(request, bucket, first_raw_key) == 404
     assert object_status(request, bucket, second_raw_key) == 404
+    assert object_body(request, bucket, legacy_key) == legacy_body
 
-    canonical_glob = "s3://#{bucket}/v1/year=*/heartbeats.parquet"
-    _ = Help.quack(duck, "SET TimeZone = 'Europe/Moscow'")
+    assert object_keys(request, bucket, "v1/") ==
+             Enum.sort([first_fragment_key, second_fragment_key, legacy_key])
 
-    assert canonical_rows(duck, canonical_glob) == %{
-             "entity" => ["synthetic/existing.ex", "synthetic/new.ex", "synthetic/new.ex"],
-             "is_write" => [false, false, true],
-             "timezone" => ["Europe/Moscow", "Europe/Moscow", "Europe/Moscow"],
-             "year" => [2025, 2025, 2025]
+    assert heartbeat_rows(duck, bucket, request) == %{
+             "entity" => [
+               "synthetic/existing.ex",
+               "synthetic/first.ex",
+               "synthetic/new.ex",
+               "synthetic/new.ex",
+               "synthetic/late.ex"
+             ],
+             "is_write" => [false, false, false, true, true],
+             "timezone" => [
+               nil,
+               "Europe/Moscow",
+               "Europe/Moscow",
+               "Europe/Moscow",
+               "Europe/Moscow"
+             ],
+             "year" => [2025, 2025, 2025, 2025, 2026]
            }
 
-    canonical_2025 = "s3://#{bucket}/v1/year=2025/heartbeats.parquet"
+    first_fragment = "s3://#{bucket}/#{first_fragment_key}"
 
     assert Help.quack(
              duck,
@@ -108,14 +125,14 @@ defmodule W3.CompactorTest do
              SELECT
                min(format_version) AS format_version,
                count(*) FILTER (WHERE compression <> 'ZSTD') AS non_zstd
-             FROM parquet_metadata('#{canonical_2025}')
-             CROSS JOIN parquet_file_metadata('#{canonical_2025}')
+             FROM parquet_metadata('#{first_fragment}')
+             CROSS JOIN parquet_file_metadata('#{first_fragment}')
              """
            ) == %{"format_version" => [2], "non_zstd" => [0]}
 
     assert Help.quack(
              duck,
-             "DESCRIBE SELECT * FROM read_parquet('#{canonical_2025}', hive_partitioning = false)"
+             "DESCRIBE SELECT * FROM read_parquet('#{first_fragment}', hive_partitioning = false)"
            )["column_name"] == [
              "time",
              "entity",
@@ -133,33 +150,94 @@ defmodule W3.CompactorTest do
              "operating_system",
              "machine_name",
              "timezone",
-             "user_agent"
+             "user_agent",
+             "ai_line_changes",
+             "ai_cached_input_tokens",
+             "ai_session",
+             "ai_subscription_plan",
+             "ai_input_tokens",
+             "ai_output_tokens",
+             "ai_prompt_length",
+             "human_line_changes",
+             "project_root_count",
+             "year"
            ]
 
-    put_raw!(request, bucket, late_raw_key, [late])
-    assert :ok = Compactor.compact!(config(credentials, bucket))
-    assert object_status(request, bucket, late_raw_key) == 404
-
-    assert canonical_rows(duck, canonical_glob) == %{
-             "entity" => [
-               "synthetic/existing.ex",
-               "synthetic/new.ex",
-               "synthetic/new.ex",
-               "synthetic/late.ex"
-             ],
-             "is_write" => [false, false, true, true],
-             "timezone" => [
-               "Europe/Moscow",
-               "Europe/Moscow",
-               "Europe/Moscow",
-               "Europe/Moscow"
-             ],
-             "year" => [2025, 2025, 2025, 2026]
+    assert Help.quack(
+             duck,
+             """
+             SELECT
+               ai_line_changes,
+               ai_cached_input_tokens,
+               ai_session,
+               ai_subscription_plan,
+               ai_input_tokens,
+               ai_output_tokens,
+               ai_prompt_length,
+               human_line_changes,
+               project_root_count
+             FROM read_parquet('#{first_fragment}')
+             WHERE entity = 'synthetic/first.ex'
+             """
+           ) == %{
+             "ai_line_changes" => [4],
+             "ai_cached_input_tokens" => [2],
+             "ai_session" => ["session-1"],
+             "ai_subscription_plan" => ["plus"],
+             "ai_input_tokens" => [3],
+             "ai_output_tokens" => [5],
+             "ai_prompt_length" => [6],
+             "human_line_changes" => [7],
+             "project_root_count" => [8]
            }
 
-    assert :ok = Compactor.compact!(config(credentials, bucket))
+    assert Help.quack(
+             duck,
+             "SELECT entity, year FROM read_parquet('#{first_fragment}') ORDER BY year"
+           ) == %{
+             "entity" => ["synthetic/first.ex", "synthetic/late.ex"],
+             "year" => [2025, 2026]
+           }
 
-    refute File.exists?(Path.join(data_path(), "w3-compactor"))
+    # Replaying an object overwrites its deterministic fragment instead of creating another one.
+    put_raw!(request, bucket, first_raw_key, [first, late])
+    assert :ok = Compactor.compact!(config(credentials, bucket))
+    assert object_status(request, bucket, first_raw_key) == 404
+
+    assert object_keys(request, bucket, "v1/") ==
+             Enum.sort([first_fragment_key, second_fragment_key, legacy_key])
+
+    assert object_body(request, bucket, legacy_key) == legacy_body
+
+    assert :ok = Compactor.compact!(config(credentials, bucket))
+  end
+
+  @tag :minio
+  test "does not read legacy canonical parquet" do
+    credentials = Help.s3_credentials(:minio)
+    suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
+    bucket = "w3-compact-ignore-canonical-#{suffix}"
+    raw_key = "raw/ignores-canonical.ndjson.zst"
+    legacy_key = "v1/year=1999/heartbeats.parquet"
+    legacy_body = "intentionally not parquet"
+
+    :ok = Help.create_bucket(credentials, bucket)
+    request = Help.s3_req(credentials)
+    duck = Help.start_duck(credentials)
+
+    on_exit(fn -> delete_objects!(request, bucket) end)
+
+    put_object!(request, bucket, legacy_key, legacy_body)
+    put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/raw-only.ex")])
+
+    assert :ok = Compactor.compact!(config(credentials, bucket))
+    assert object_status(request, bucket, raw_key) == 404
+    assert object_body(request, bucket, legacy_key) == legacy_body
+
+    assert fragment_rows(duck, bucket, request) == %{
+             "entity" => ["synthetic/raw-only.ex"],
+             "year" => [2022]
+           }
   end
 
   @tag :minio
@@ -168,7 +246,7 @@ defmodule W3.CompactorTest do
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-invalid-#{suffix}"
     raw_key = "raw/invalid.ndjson.zst"
-    canonical_key = "v1/year=2022/heartbeats.parquet"
+    fragment_key = fragment_key(raw_key)
 
     invalid_heartbeats =
       Enum.map(~w(time entity type machine_name), fn field ->
@@ -181,14 +259,11 @@ defmodule W3.CompactorTest do
     duck = Help.start_duck(credentials)
     put_raw!(request, bucket, raw_key, invalid_heartbeats)
 
-    on_exit(fn ->
-      Req.delete(request, url: "s3://#{bucket}/#{raw_key}")
-      Req.delete(request, url: "s3://#{bucket}/#{canonical_key}")
-    end)
+    on_exit(fn -> delete_objects!(request, bucket) end)
 
     assert :ok = Compactor.compact!(config(credentials, bucket))
     assert object_status(request, bucket, raw_key) == 404
-    assert object_status(request, bucket, canonical_key) == 404
+    assert object_status(request, bucket, fragment_key) == 404
 
     put_raw!(request, bucket, raw_key, [
       heartbeat(entity: "synthetic/valid.ex") | invalid_heartbeats
@@ -196,12 +271,12 @@ defmodule W3.CompactorTest do
 
     assert :ok = Compactor.compact!(config(credentials, bucket))
     assert object_status(request, bucket, raw_key) == 404
-    assert object_status(request, bucket, canonical_key) == 200
+    assert object_status(request, bucket, fragment_key) == 200
 
-    assert Help.quack(
-             duck,
-             "SELECT entity FROM read_parquet('s3://#{bucket}/v1/year=*/heartbeats.parquet')"
-           ) == %{"entity" => ["synthetic/valid.ex"]}
+    assert fragment_rows(duck, bucket, request) == %{
+             "entity" => ["synthetic/valid.ex"],
+             "year" => [2022]
+           }
   end
 
   @tag :minio
@@ -210,7 +285,7 @@ defmodule W3.CompactorTest do
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-schedule-#{suffix}"
     raw_key = "raw/scheduled.ndjson.zst"
-    canonical_key = "v1/year=2022/heartbeats.parquet"
+    fragment_key = fragment_key(raw_key)
     local_data_path = Path.join(data_path(), "w3-compact\\'#{suffix}")
 
     :ok = Help.create_bucket(credentials, bucket)
@@ -218,8 +293,7 @@ defmodule W3.CompactorTest do
     put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/scheduled.ex")])
 
     on_exit(fn ->
-      Req.delete(request, url: "s3://#{bucket}/#{raw_key}")
-      Req.delete(request, url: "s3://#{bucket}/#{canonical_key}")
+      delete_objects!(request, bucket)
       File.rm_rf(local_data_path)
     end)
 
@@ -245,7 +319,7 @@ defmodule W3.CompactorTest do
     assert second_duration >= 0
     assert Process.alive?(pid)
     assert object_status(request, bucket, raw_key) == 404
-    assert object_status(request, bucket, canonical_key) == 200
+    assert object_status(request, bucket, fragment_key) == 200
   end
 
   @tag :minio
@@ -254,16 +328,13 @@ defmodule W3.CompactorTest do
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-restart-#{suffix}"
     raw_key = "raw/retry.ndjson.zst"
-    canonical_key = "v1/year=2022/heartbeats.parquet"
+    fragment_key = fragment_key(raw_key)
 
     :ok = Help.create_bucket(credentials, bucket)
     request = Help.s3_req(credentials)
     put_raw!(request, bucket, raw_key, [invalid_heartbeat()])
 
-    on_exit(fn ->
-      Req.delete(request, url: "s3://#{bucket}/#{raw_key}")
-      Req.delete(request, url: "s3://#{bucket}/#{canonical_key}")
-    end)
+    on_exit(fn -> delete_objects!(request, bucket) end)
 
     telemetry_ref =
       Help.attach_telemetry([
@@ -300,7 +371,7 @@ defmodule W3.CompactorTest do
     assert log =~ "heartbeat compaction failed"
     assert log =~ "heartbeat compaction complete"
     assert object_status(request, bucket, raw_key) == 404
-    assert object_status(request, bucket, canonical_key) == 200
+    assert object_status(request, bucket, fragment_key) == 200
   end
 
   @tag :minio
@@ -332,24 +403,32 @@ defmodule W3.CompactorTest do
   end
 
   @tag :minio
-  test "a failed local merge closes DuckDB and preserves raw" do
+  test "a malformed object is preserved without blocking other raw objects" do
     credentials = Help.s3_credentials(:minio)
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-failure-#{suffix}"
     raw_key = "raw/failure.ndjson.zst"
+    valid_raw_key = "raw/valid.ndjson.zst"
+    valid_fragment_key = fragment_key(valid_raw_key)
+    local_data_path = Path.join(data_path(), "w3-compact-failure-local-#{suffix}")
 
     :ok = Help.create_bucket(credentials, bucket)
     request = Help.s3_req(credentials)
+    duck = Help.start_duck(credentials)
     put_raw!(request, bucket, raw_key, [invalid_heartbeat()])
+    put_raw!(request, bucket, valid_raw_key, [heartbeat(entity: "synthetic/valid.ex")])
 
-    on_exit(fn -> Req.delete(request, url: "s3://#{bucket}/#{raw_key}") end)
+    on_exit(fn ->
+      delete_objects!(request, bucket)
+      File.rm_rf(local_data_path)
+    end)
 
     telemetry_ref = Help.attach_telemetry([[:w3, :compact, :exception]])
 
     log =
       capture_log(fn ->
         assert_raise DuckNIF.Error, fn ->
-          Compactor.compact!(config(credentials, bucket))
+          Compactor.compact!(config(credentials, bucket, local_data_path))
         end
       end)
 
@@ -368,19 +447,66 @@ defmodule W3.CompactorTest do
     assert log =~ bucket
     assert log =~ Exception.message(reason)
     assert object_status(request, bucket, raw_key) == 200
+    assert object_status(request, bucket, valid_raw_key) == 404
+    assert object_status(request, bucket, valid_fragment_key) == 200
 
-    refute File.exists?(Path.join(data_path(), "w3-compactor"))
+    assert fragment_rows(duck, bucket, request) == %{
+             "entity" => ["synthetic/valid.ex"],
+             "year" => [2022]
+           }
+
+    refute File.exists?(Path.join(local_data_path, "w3-compactor"))
   end
 
-  defp canonical_rows(duck, glob) do
+  defp heartbeat_rows(duck, bucket, request) do
+    legacy =
+      request
+      |> object_keys(bucket, "v1/year=")
+      |> Enum.filter(&String.ends_with?(&1, "/heartbeats.parquet"))
+
+    fragments = object_keys(request, bucket, "v1/fragments/raw-")
+
+    relations =
+      [
+        parquet_relation(bucket, legacy, true),
+        parquet_relation(bucket, fragments, false)
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join("\nUNION ALL BY NAME\n")
+
     Help.quack(
       duck,
       """
       SELECT year, entity, is_write, timezone
-      FROM read_parquet('#{glob}', hive_partitioning = true, union_by_name = true)
+      FROM (#{relations})
       ORDER BY year, entity, is_write
       """
     )
+  end
+
+  defp fragment_rows(duck, bucket, request) do
+    fragments = object_keys(request, bucket, "v1/fragments/raw-")
+
+    Help.quack(
+      duck,
+      """
+      SELECT entity, year
+      FROM read_parquet(#{parquet_paths(bucket, fragments)}, hive_partitioning = false)
+      ORDER BY year, entity
+      """
+    )
+  end
+
+  defp parquet_relation(_bucket, [], _hive_partitioning), do: nil
+
+  defp parquet_relation(bucket, keys, hive_partitioning) do
+    "SELECT * FROM read_parquet(#{parquet_paths(bucket, keys)}, " <>
+      "hive_partitioning = #{hive_partitioning}, union_by_name = true)"
+  end
+
+  defp parquet_paths(bucket, keys) do
+    paths = Enum.map_join(keys, ", ", &sql_quote("s3://#{bucket}/#{&1}"))
+    "[#{paths}]"
   end
 
   defp seed_legacy!(duck, bucket) do
@@ -438,12 +564,60 @@ defmodule W3.CompactorTest do
     assert status in 200..299
   end
 
+  defp put_object!(request, bucket, key, body) do
+    assert %{status: status} = Req.put!(request, url: "s3://#{bucket}/#{key}", body: body)
+    assert status in 200..299
+  end
+
+  defp object_body(request, bucket, key) do
+    assert %{status: status, body: body} =
+             Req.get!(request, url: "s3://#{bucket}/#{key}", raw: true)
+
+    assert status in 200..299
+    IO.iodata_to_binary(body)
+  end
+
   defp object_status(request, bucket, key) do
     Req.head!(request, url: "s3://#{bucket}/#{key}").status
   end
 
+  defp object_keys(request, bucket, prefix) do
+    response =
+      Req.get!(request,
+        url: "s3://#{bucket}",
+        params: %{"list-type" => "2", "prefix" => prefix}
+      )
+
+    assert response.status in 200..299
+
+    contents = response.body["ListBucketResult"]["Contents"] || []
+
+    contents
+    |> Enum.map(&Map.fetch!(&1, "Key"))
+    |> Enum.sort()
+  end
+
+  defp delete_objects!(request, bucket) do
+    for key <- object_keys(request, bucket, "") do
+      assert %{status: status} = Req.delete!(request, url: "s3://#{bucket}/#{key}")
+      assert status in 200..299
+    end
+  end
+
+  defp fragment_key(raw_key) do
+    source_id = :sha256 |> :crypto.hash(raw_key) |> Base.encode16(case: :lower)
+    "v1/fragments/raw-#{source_id}.parquet"
+  end
+
+  defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"
+
   defp unix_seconds(datetime), do: DateTime.to_unix(datetime, :microsecond) / 1_000_000
-  defp config(credentials, bucket), do: %{s3: store(credentials, bucket), data_path: data_path()}
+  defp config(credentials, bucket), do: config(credentials, bucket, data_path())
+
+  defp config(credentials, bucket, local_data_path) do
+    %{s3: store(credentials, bucket), data_path: local_data_path}
+  end
+
   defp data_path, do: System.get_env("DATA_PATH", System.tmp_dir!())
   defp store(credentials, bucket), do: Map.put(credentials, :bucket, bucket)
 end

@@ -1,9 +1,9 @@
 defmodule W3.Compactor do
   @moduledoc """
-  Merges a snapshot of raw heartbeats into the annual Parquet files.
+  Converts raw heartbeat objects into deterministic Parquet fragments.
 
-  Object I/O is handled by Req. DuckDB only sees temporary local files, and
-  its database and connection exist only while the local merge is running.
+  Existing Parquet is deliberately not read on this hot path. Object I/O is
+  handled by Req, while DuckDB only sees temporary local files.
   """
 
   def start_link(options) do
@@ -15,7 +15,7 @@ defmodule W3.Compactor do
       Keyword.get(
         options,
         :backoff,
-        %{base: to_timeout(second: 1), max: to_timeout(second: 30)}
+        %{base: to_timeout(second: 1), max: to_timeout(second: 60)}
       )
 
     task = {__MODULE__, :compact!, [%{s3: s3, data_path: data_path}]}
@@ -53,43 +53,55 @@ defmodule W3.Compactor do
 
   defp compact!(s3, raw_keys, directory) do
     raw_directory = Path.join(directory, "raw")
-    canonical_directory = Path.join(directory, "canonical")
     output_directory = Path.join(directory, "output")
 
-    Enum.each([raw_directory, canonical_directory, output_directory], &File.mkdir_p!/1)
+    Enum.each([raw_directory, output_directory], &File.mkdir_p!/1)
 
     try do
       raw_files = download!(s3, raw_keys, raw_directory, ".ndjson.zst")
+      {conversions, failures} = convert(raw_files, output_directory)
 
-      canonical_keys =
-        s3
-        |> list_keys("v1/year=")
-        |> Enum.filter(&String.ends_with?(&1, "/heartbeats.parquet"))
-
-      canonical_files =
-        download!(s3, canonical_keys, canonical_directory, ".parquet")
-
-      sql(raw_files, canonical_files, output_directory)
-
-      outputs =
-        for partition <- File.ls!(output_directory),
-            directory = Path.join(output_directory, partition),
-            File.dir?(directory),
-            file <- File.ls!(directory),
-            String.ends_with?(file, ".parquet") do
-          Path.join(directory, file)
-        end
-
-      Enum.each(outputs, &upload!(s3, &1))
-      Enum.each(raw_keys, &delete!(s3, &1))
-      :ok
+      async_map!(conversions, &commit!(s3, &1))
+      raise_first!(failures)
     after
       File.rm_rf!(directory)
     end
   end
 
-  defp sql(raw_files, canonical_files, output_directory) do
+  defp convert(raw_files, output_directory) do
     W3.Duck.with_duck(fn conn ->
+      raw_files
+      |> Enum.reduce({[], []}, fn raw_file, {conversions, failures} ->
+        try do
+          conversion = convert_one!(conn, raw_file, output_directory)
+          {[conversion | conversions], failures}
+        catch
+          kind, reason -> {conversions, [{kind, reason, __STACKTRACE__} | failures]}
+        end
+      end)
+      |> then(fn {conversions, failures} ->
+        {Enum.reverse(conversions), Enum.reverse(failures)}
+      end)
+    end)
+  end
+
+  defp convert_one!(conn, %{key: raw_key, path: raw_file}, output_directory) do
+    source_id = source_id(raw_key)
+    filename = "raw-#{source_id}.parquet"
+    path = Path.join(output_directory, filename)
+
+    output =
+      if copy_raw!(conn, raw_file, path) == 0 do
+        nil
+      else
+        %{key: "v1/fragments/#{filename}", path: path}
+      end
+
+    %{raw_key: raw_key, output: output}
+  end
+
+  defp copy_raw!(conn, raw_file, output) do
+    result =
       W3.Duck.query(
         conn,
         """
@@ -113,13 +125,22 @@ defmodule W3.Compactor do
                 is_write: 'BOOLEAN',
                 machine_name: 'VARCHAR',
                 timezone: 'VARCHAR',
-                user_agent: 'VARCHAR'
+                user_agent: 'VARCHAR',
+                ai_line_changes: 'BIGINT',
+                ai_cached_input_tokens: 'BIGINT',
+                ai_session: 'VARCHAR',
+                ai_subscription_plan: 'VARCHAR',
+                ai_input_tokens: 'BIGINT',
+                ai_output_tokens: 'BIGINT',
+                ai_prompt_length: 'BIGINT',
+                human_line_changes: 'BIGINT',
+                project_root_count: 'BIGINT'
               },
               compression = 'zstd',
               format = 'newline_delimited',
               union_by_name = true
             )
-          ), raw AS (
+          ), event AS (
             SELECT
               to_timestamp(time)::TIMESTAMPTZ AS time,
               entity::VARCHAR AS entity,
@@ -139,58 +160,42 @@ defmodule W3.Compactor do
                 ''
               )::VARCHAR AS operating_system,
               machine_name::VARCHAR AS machine_name,
-              timezone::VARCHAR AS timezone,
-              user_agent::VARCHAR AS user_agent
+              max(nullif(timezone, '')) AS timezone,
+              max(nullif(user_agent, '')) AS user_agent,
+              ai_line_changes::BIGINT AS ai_line_changes,
+              ai_cached_input_tokens::BIGINT AS ai_cached_input_tokens,
+              ai_session::VARCHAR AS ai_session,
+              ai_subscription_plan::VARCHAR AS ai_subscription_plan,
+              ai_input_tokens::BIGINT AS ai_input_tokens,
+              ai_output_tokens::BIGINT AS ai_output_tokens,
+              ai_prompt_length::BIGINT AS ai_prompt_length,
+              human_line_changes::BIGINT AS human_line_changes,
+              project_root_count::BIGINT AS project_root_count,
+              year(timezone('UTC', to_timestamp(time)))::INTEGER AS year
             FROM raw_input
-          ), event AS (
-            SELECT *
-            FROM read_parquet(
-              from_json(CAST($canonical_files AS VARCHAR), '["VARCHAR"]'),
-              union_by_name = true
-            )
-            UNION ALL BY NAME
-            SELECT *
-            FROM raw
+            WHERE time IS NOT NULL
+              AND entity IS NOT NULL
+              AND type IS NOT NULL
+              AND machine_name IS NOT NULL
+            GROUP BY ALL
           )
-          SELECT
-            event.time,
-            event.entity,
-            event.type,
-            event.category,
-            event.project,
-            event.branch,
-            event.language,
-            event.dependencies,
-            event.lines,
-            event.lineno,
-            event.cursorpos,
-            event.is_write,
-            event.editor,
-            event.operating_system,
-            event.machine_name,
-            max(nullif(event.timezone, '')) AS timezone,
-            max(nullif(event.user_agent, '')) AS user_agent,
-            year(timezone('UTC', event.time))::INTEGER AS year
+          SELECT *
           FROM event
-          WHERE event.time IS NOT NULL
-            AND event.entity IS NOT NULL
-            AND event.type IS NOT NULL
-            AND event.machine_name IS NOT NULL
-          GROUP BY ALL
           ORDER BY year, time, entity
-        ) TO #{sql_quote(output_directory)} (
+        ) TO #{sql_quote(output)} (
           FORMAT PARQUET,
-          PARTITION_BY (year),
           COMPRESSION ZSTD,
-          PARQUET_VERSION V2
+          PARQUET_VERSION V2,
+          ROW_GROUP_SIZE 122880
         );
         """,
-        %{
-          "raw_files" => JSON.encode!(raw_files),
-          "canonical_files" => JSON.encode!(canonical_files)
-        }
+        %{"raw_files" => JSON.encode!([raw_file])}
       )
-    end)
+
+    case for(%{"Count" => counts} <- result, count <- counts, do: count) do
+      [] -> raise "DuckDB COPY did not return a row count: #{inspect(result)}"
+      counts -> Enum.sum(counts)
+    end
   end
 
   defp req(s3) do
@@ -234,36 +239,31 @@ defmodule W3.Compactor do
   defp download!(s3, keys, directory, extension) do
     req = req(s3)
 
-    W3.TaskSupervisor
-    |> Task.Supervisor.async_stream_nolink(
+    async_map!(
       Enum.with_index(keys),
       fn {key, index} ->
         response = Req.get!(req, url: "s3://#{s3.bucket}/#{key}", raw: true) |> success!()
         path = Path.join(directory, "#{index}#{extension}")
         File.write!(path, response.body)
-        {:ok, path}
-      end,
-      ordered: false,
-      timeout: :infinity
+        %{key: key, path: path}
+      end
     )
-    |> Enum.map(fn
-      {:ok, {:ok, path}} -> path
-      {:ok, {:error, kind, reason, stacktrace}} -> :erlang.raise(kind, reason, stacktrace)
-      {:exit, reason} -> exit(reason)
-    end)
   end
 
-  defp upload!(s3, path) do
-    "year=" <> year = path |> Path.dirname() |> Path.basename()
-
+  defp upload!(s3, %{key: key, path: path}) do
     Req.put!(req(s3),
-      url: "s3://#{s3.bucket}/v1/year=#{year}/heartbeats.parquet",
+      url: "s3://#{s3.bucket}/#{key}",
       headers: %{"content-type" => "application/vnd.apache.parquet"},
       body: File.read!(path)
     )
     |> success!()
 
     :ok
+  end
+
+  defp commit!(s3, %{raw_key: raw_key, output: output}) do
+    if output, do: upload!(s3, output)
+    delete!(s3, raw_key)
   end
 
   defp delete!(s3, key) do
@@ -274,7 +274,41 @@ defmodule W3.Compactor do
   defp success!(%{status: status} = response) when status in 200..299, do: response
 
   defp success!(response) do
-    raise "unexpected response: #{inspect(response)}"
+    :erlang.error({:s3_response, Map.take(response, [:status, :headers, :body])})
+  end
+
+  defp async_map!(enumerable, fun) do
+    W3.TaskSupervisor
+    |> Task.Supervisor.async_stream_nolink(
+      enumerable,
+      fn item ->
+        try do
+          {:ok, fun.(item)}
+        catch
+          kind, reason -> {:error, kind, reason, __STACKTRACE__}
+        end
+      end,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.to_list()
+    |> Enum.map(fn
+      {:ok, {:ok, result}} -> result
+      {:ok, {:error, kind, reason, stacktrace}} -> :erlang.raise(kind, reason, stacktrace)
+      {:exit, reason} -> exit(reason)
+    end)
+  end
+
+  defp raise_first!([]), do: :ok
+
+  defp raise_first!([{kind, reason, stacktrace} | _failures]) do
+    :erlang.raise(kind, reason, stacktrace)
+  end
+
+  defp source_id(raw_key) do
+    :sha256
+    |> :crypto.hash(raw_key)
+    |> Base.encode16(case: :lower)
   end
 
   defp sql_quote(value), do: "'#{String.replace(value, "'", "''")}'"
