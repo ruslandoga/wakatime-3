@@ -4,7 +4,7 @@ defmodule W3.Application do
 
   @impl true
   def start(_type, _args) do
-    attach_compactor_logger()
+    W3.LoggerTelemetryHandler.attach()
 
     config = W3.config()
 
@@ -23,18 +23,6 @@ defmodule W3.Application do
 
   @impl true
   def stop(_state) do
-    :telemetry.detach({W3.Compactor, :logger})
-  end
-
-  defp attach_compactor_logger do
-    :telemetry.attach_many(
-      {W3.Compactor, :logger},
-      [
-        [:w3, :compactor, :run, :stop],
-        [:w3, :compactor, :run, :exception]
-      ],
-      &W3.Compactor.handle_event/4,
-      nil
-    )
+    W3.LoggerTelemetryHandler.detach()
   end
 end

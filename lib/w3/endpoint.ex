@@ -2,8 +2,6 @@ defmodule W3.Endpoint do
   @moduledoc false
   use Plug.Router
 
-  require Logger
-
   def start_link(options) do
     {api_key, options} = Keyword.pop!(options, :api_key)
     {s3, options} = Keyword.pop!(options, :s3)
@@ -103,8 +101,7 @@ defmodule W3.Endpoint do
         |> put_resp_header("content-type", "application/json; charset=utf-8")
         |> send_resp(201, json)
 
-      {:error, reason} ->
-        Logger.warning("failed to upload heartbeats: #{inspect(reason)}")
+      {:error, _reason} ->
         send_resp(conn, 503, "service unavailable")
     end
   end
@@ -120,9 +117,11 @@ defmodule W3.Endpoint do
     |> String.split("\n", trim: true)
     |> Enum.map(&JSON.decode!/1)
     |> Enum.each(fn %{"level" => level} = log ->
-      level
-      |> String.to_existing_atom()
-      |> Logger.log(log)
+      :telemetry.execute(
+        [:w3, :plugin, :log],
+        %{},
+        %{level: String.to_existing_atom(level), log: log}
+      )
     end)
 
     send_resp(conn, 201, [])

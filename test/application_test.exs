@@ -29,7 +29,7 @@ defmodule W3.ApplicationTest do
 
     assert Enum.any?(
              :telemetry.list_handlers([:w3, :compactor, :run, :stop]),
-             &(&1.id == {W3.Compactor, :logger})
+             &(&1.id == W3.LoggerTelemetryHandler)
            )
   end
 end

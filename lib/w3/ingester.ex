@@ -53,7 +53,7 @@ defmodule W3.Ingester do
           {:error, exception} -> {:error, exception}
         end
 
-      {result, metadata}
+      {result, Map.put(metadata, :result, result)}
     end)
   rescue
     exception -> {:error, exception}

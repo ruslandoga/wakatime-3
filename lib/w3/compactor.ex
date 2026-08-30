@@ -8,8 +8,6 @@ defmodule W3.Compactor do
   its database and connection exist only while the local merge is running.
   """
 
-  require Logger
-
   def start_link(options) do
     GenServer.start_link(__MODULE__, options, name: __MODULE__)
   end
@@ -42,18 +40,6 @@ defmodule W3.Compactor do
       store!(s3)
       {compact_snapshot!(s3), metadata}
     end)
-  end
-
-  def handle_event([:w3, :compactor, :run, :stop], _measurements, metadata, _config) do
-    Logger.info("heartbeat compaction complete", bucket: metadata.bucket)
-  end
-
-  def handle_event([:w3, :compactor, :run, :exception], _measurements, metadata, _config) do
-    Logger.error(
-      "heartbeat compaction failed:\n" <>
-        Exception.format(metadata.kind, metadata.reason, metadata.stacktrace),
-      bucket: metadata.bucket
-    )
   end
 
   defp compact_snapshot!(s3) do
