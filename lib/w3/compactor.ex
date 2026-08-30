@@ -178,8 +178,7 @@ defmodule W3.Compactor do
         ) TO #{sql_quote(output)} (
           FORMAT PARQUET,
           COMPRESSION ZSTD,
-          PARQUET_VERSION V2,
-          ROW_GROUP_SIZE 122880
+          PARQUET_VERSION V2
         );
         """,
         %{"raw_files" => JSON.encode!([raw_file])}

@@ -95,8 +95,8 @@ files. It defaults to the system temporary directory; only its `w3-compactor` ch
 Once conversion starts, its database and connection are scoped to that run and closed on success or
 failure; the state machine retains no DuckDB handle between runs.
 
-Fragments use UTC `TIMESTAMPTZ`, Parquet V2 data pages, Zstandard compression, 122,880-row groups,
-and a physical UTC `year` column. Existing annual files remain readable alongside fragments. Until a
+Fragments use UTC `TIMESTAMPTZ`, Parquet V2 data pages, Zstandard compression, and a physical UTC
+`year` column. Existing annual files remain readable alongside fragments. Until a
 separate Parquet compactor folds fragments into the annual files, analytics should query both layouts
 and deduplicate events—not raw NDJSON:
 
