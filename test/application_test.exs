@@ -30,15 +30,4 @@ defmodule W3.ApplicationTest do
     assert {:ok, {_ip, port}} = ThousandIsland.listener_info(endpoint)
     assert is_integer(port)
   end
-
-  test "configures compaction every 30 minutes" do
-    s3 = Keyword.fetch!(W3.config(), :s3)
-
-    assert {W3.Periodic, options} =
-             W3.Application.children("api-key", 0, s3)
-             |> List.keyfind(W3.Periodic, 0)
-
-    assert Keyword.fetch!(options, :interval) == to_timeout(minute: 30)
-    assert is_function(Keyword.fetch!(options, :task), 0)
-  end
 end

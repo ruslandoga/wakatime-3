@@ -45,7 +45,7 @@ defmodule W3.Periodic do
   end
 
   def handle_event(:internal, {:start, failure_count}, :idle, config) do
-    # A fresh task releases Plug-owned temporary files after every attempt.
+    # A fresh task releases its heap and temporary-file/stream resources after every attempt.
     task = Task.Supervisor.async_nolink(W3.task_supervisor(), config.task)
     {:next_state, {:busy, task.ref, failure_count}, config}
   end

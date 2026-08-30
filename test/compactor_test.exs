@@ -19,7 +19,11 @@ defmodule W3.CompactorTest do
     duck = Help.start_duck(credentials)
     s3 = struct!(W3.S3, Map.put(credentials, :bucket, bucket))
 
-    on_exit(fn -> delete_objects!(request, bucket) end)
+    on_exit(fn ->
+      delete_objects!(request, bucket)
+      assert %{status: status} = Req.delete!(request, url: "s3://#{bucket}")
+      assert status in 200..299
+    end)
 
     {:ok, bucket: bucket, request: request, duck: duck, s3: s3}
   end
@@ -307,14 +311,14 @@ defmodule W3.CompactorTest do
 
     log =
       capture_log(fn ->
-        assert_raise MatchError, fn ->
+        assert_raise RuntimeError, fn ->
           W3.Compactor.compact_raw_files_into_parquet(s3)
         end
       end)
 
     assert log =~ "heartbeat compaction failed"
     assert log =~ missing_bucket
-    assert log =~ "status: 404"
+    assert log =~ "HTTP 404"
     assert log =~ "NoSuchBucket"
   end
 

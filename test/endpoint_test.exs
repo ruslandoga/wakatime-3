@@ -190,14 +190,16 @@ defmodule W3.EndpointTest do
                       %{
                         bucket: ^bucket,
                         key: key,
-                        result: {:error, %Req.Response{status: 404}}
+                        result: {:error, error}
                       }}
 
+      assert error =~ "HTTP 404"
+      assert error =~ "NoSuchBucket"
       assert logs =~ "failed to upload 1 heartbeat(s)"
       assert logs =~ "#{bytes} compressed bytes"
       assert logs =~ "#{System.convert_time_unit(duration, :native, :millisecond)}ms"
       assert logs =~ "s3://#{bucket}/#{key}"
-      assert logs =~ "status: 404"
+      assert logs =~ "HTTP 404"
       assert logs =~ "NoSuchBucket"
     end
   end

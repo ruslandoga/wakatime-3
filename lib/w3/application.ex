@@ -12,20 +12,15 @@ defmodule W3.Application do
     port = Keyword.fetch!(config, :port)
     s3 = Keyword.fetch!(config, :s3)
 
-    children = children(api_key, port, s3)
-
-    Supervisor.start_link(children, strategy: :one_for_one, name: W3.Supervisor)
-  end
-
-  @doc false
-  def children(api_key, port, s3) do
-    [
+    children = [
       {Task.Supervisor, name: W3.task_supervisor()},
       {W3.Endpoint, port: port, api_key: api_key, s3: s3},
       {W3.Periodic,
        interval: to_timeout(minute: 30),
        task: fn -> W3.Compactor.compact_raw_files_into_parquet(s3) end}
     ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: W3.Supervisor)
   end
 
   @impl true

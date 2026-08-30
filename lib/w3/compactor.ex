@@ -5,6 +5,8 @@ defmodule W3.Compactor do
 
   alias W3.{S3, Duck}
 
+  @upload_chunk_size 1024 * 1024
+
   def compact_raw_files_into_parquet(s3) do
     metadata = %{bucket: s3.bucket}
 
@@ -37,12 +39,16 @@ defmodule W3.Compactor do
       end)
       |> W3.async_map!(
         fn %{key: key, path: path} ->
-          %{status: 200} =
+          response =
             Req.get!(base_req,
               url: S3.object_url(s3, key),
-              into: File.stream!(path),
+              into: File.stream!(path, [:delayed_write]),
               raw: true
             )
+
+          unless response.status == 200 do
+            raise "failed to download #{key}: #{S3.response_error(response)}"
+          end
 
           path
         end,
@@ -62,7 +68,7 @@ defmodule W3.Compactor do
         Req.put!(
           base_req,
           url: S3.object_url(s3, processed_key),
-          body: File.stream!(parquet_path, 64 * 1024),
+          body: File.stream!(parquet_path, @upload_chunk_size, read_ahead: @upload_chunk_size),
           headers: %{
             "content-length" => Integer.to_string(parquet_size),
             "content-type" => "application/vnd.apache.parquet"
@@ -70,7 +76,7 @@ defmodule W3.Compactor do
         )
 
       unless response.status in 200..299 do
-        raise "failed to upload #{processed_key}: #{inspect(response)}"
+        raise "failed to upload #{processed_key}: #{S3.response_error(response)}"
       end
     end
 
