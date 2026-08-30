@@ -3,29 +3,24 @@ defmodule W3.EndpointTest do
 
   @moduletag :minio
 
-  setup_all do
+  setup context do
     bucket =
       "w3-ingester-test-#{System.system_time(:second)}-#{System.unique_integer([:positive])}"
 
     s3 = Help.create_s3(bucket)
-
-    {:ok, s3: s3, bucket: bucket}
-  end
-
-  setup context do
     api_key = "406fe41f-6d69-4183-a4cc-121e0c524c2b"
 
-    s3 =
+    endpoint_s3 =
       if context[:missing_bucket],
-        do: %{context.s3 | bucket: "#{context.bucket}-missing"},
-        else: context.s3
+        do: %{s3 | bucket: "#{bucket}-missing"},
+        else: s3
 
-    url = Help.start_endpoint(api_key: api_key, s3: s3)
+    url = Help.start_endpoint(api_key: api_key, s3: endpoint_s3)
     req = Req.new(base_url: url, auth: {:basic, api_key})
 
-    on_exit(fn -> delete_objects!(Help.s3_req(context.s3), context.bucket) end)
+    on_exit(fn -> delete_objects!(Help.s3_req(s3), bucket) end)
 
-    {:ok, req: req, bucket: s3.bucket}
+    {:ok, req: req, bucket: endpoint_s3.bucket}
   end
 
   describe "auth" do

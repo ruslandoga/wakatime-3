@@ -9,23 +9,18 @@ defmodule W3.CompactorTest do
   @user_agent "wakatime/v1.45.3 (darwin-21.4.0-arm64) go1.18.1 " <>
                 "vscode/1.68.0-insider vscode-wakatime/18.1.5"
 
-  setup_all do
+  setup do
     credentials = Help.s3_credentials(:minio)
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-#{suffix}"
 
     :ok = Help.create_bucket(credentials, bucket)
-
-    {:ok, credentials: credentials, bucket: bucket}
-  end
-
-  setup %{credentials: credentials, bucket: bucket} do
     request = Help.s3_req(credentials)
     duck = Help.start_duck(credentials)
 
     on_exit(fn -> delete_objects!(request, bucket) end)
 
-    {:ok, request: request, duck: duck}
+    {:ok, credentials: credentials, bucket: bucket, request: request, duck: duck}
   end
 
   test "writes deterministic year parts for each raw object without changing legacy parquet", %{
