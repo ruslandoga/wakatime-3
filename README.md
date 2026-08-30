@@ -33,7 +33,9 @@ docker run --detach \
   --restart always \
   --pull always \
   --publish 6767:6767 \
+  --volume w3_data:/data \
   -e HTTP_PORT=6767 \
+  -e PLUG_TMPDIR=/data \
   -e API_KEY=your-wakatime-shaped-api-key \
   -e AWS_S3_BUCKET=w3 \
   -e AWS_REGION=auto \
