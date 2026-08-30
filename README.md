@@ -68,7 +68,8 @@ No manifest, persistent state, dated generation, or lifecycle rule is needed.
 For now the compactor uses the application's existing read/write S3 credentials and bucket. Keep the
 bucket private: do not enable `r2.dev`, a public custom domain, or browser CORS. `W3.Compactor` uses
 a supervised `W3.Periodic` state machine. Its first run starts after one minute, and the next starts
-one minute after each attempt finishes.
+one minute after each successful attempt finishes. Failed attempts retry with full-jitter exponential
+backoff using a one-second base and one-minute cap.
 Compactions emit telemetry under `[:w3, :compact]`, heartbeat uploads under `[:w3, :upload]`, and
 plugin logs under `[:w3, :log]`. All application logging is performed by a central telemetry
 handler; the endpoint, ingester, and compactor only emit events. Span logs include elapsed time;

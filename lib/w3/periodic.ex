@@ -1,11 +1,13 @@
 defmodule W3.Periodic do
   @moduledoc """
-  Runs a function or MFA repeatedly with a fixed delay between completed runs.
+  Runs a function or MFA repeatedly.
 
-  Exceptions do not cancel future runs. Throws and exits propagate.
+  Successful runs wait for the configured interval. Exceptions retry with
+  full-jitter exponential backoff; throws and exits propagate.
   """
 
   @behaviour :gen_statem
+  alias W3.Backoff
 
   def start_link(state) do
     :gen_statem.start_link(__MODULE__, state, [])
@@ -17,26 +19,35 @@ defmodule W3.Periodic do
   end
 
   @impl :gen_statem
-  def init({interval, _task} = state) do
-    {:ok, :no_state, state, schedule(interval)}
+  def init({interval, _backoff, _task} = state) do
+    {:ok, :no_state, state, schedule(interval, _failure_count = 0)}
   end
 
   @impl :gen_statem
-  def handle_event({:timeout, :run}, [], _state, _data) do
-    {:keep_state_and_data, {:next_event, :internal, :run}}
+  def handle_event({:timeout, :run}, failure_count, _state, _data) do
+    {:keep_state_and_data, {:next_event, :internal, {:run, failure_count}}}
   end
 
-  def handle_event(:internal, :run, _state, {interval, task}) do
-    try do
-      run(task)
-    rescue
-      _exception -> :ok
-    end
+  def handle_event(:internal, {:run, failure_count}, _state, {interval, backoff, task}) do
+    next =
+      try do
+        run(task)
+      rescue
+        _exception ->
+          delay = Backoff.delay(backoff, failure_count)
+          schedule(delay, failure_count + 1)
+      else
+        _result ->
+          schedule(interval, _failure_count = 0)
+      end
 
-    {:keep_state_and_data, schedule(interval)}
+    {:keep_state_and_data, next}
   end
 
-  defp schedule(interval), do: {{:timeout, :run}, interval, _no_content = []}
+  defp schedule(delay, failure_count) do
+    {{:timeout, :run}, delay, failure_count}
+  end
+
   defp run({module, function, arguments}), do: apply(module, function, arguments)
   defp run(function) when is_function(function, 0), do: function.()
 end

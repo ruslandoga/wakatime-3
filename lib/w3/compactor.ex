@@ -10,9 +10,17 @@ defmodule W3.Compactor do
     s3 = options |> Keyword.fetch!(:s3) |> Map.new()
     data_path = Keyword.fetch!(options, :data_path)
     interval = Keyword.get(options, :interval, to_timeout(second: 60))
+
+    backoff =
+      Keyword.get(
+        options,
+        :backoff,
+        W3.Backoff.new(base: to_timeout(second: 1), max: to_timeout(second: 60))
+      )
+
     task = {__MODULE__, :compact!, [%{s3: s3, data_path: data_path}]}
 
-    W3.Periodic.start_link({interval, task})
+    W3.Periodic.start_link({interval, backoff, task})
   end
 
   def child_spec(options) do
@@ -28,23 +36,22 @@ defmodule W3.Compactor do
   end
 
   defp compact_snapshot!(s3, data_path) do
-    request = request(s3)
     directory = Path.join(data_path, "w3-compactor")
     File.rm_rf!(directory)
 
     raw_keys =
-      request
-      |> list_keys(s3.bucket, "raw/")
+      s3
+      |> list_keys("raw/")
       |> Enum.filter(&String.ends_with?(&1, ".ndjson.zst"))
 
     if raw_keys == [] do
       :ok
     else
-      compact!(request, s3.bucket, raw_keys, directory)
+      compact!(s3, raw_keys, directory)
     end
   end
 
-  defp compact!(request, bucket, raw_keys, directory) do
+  defp compact!(s3, raw_keys, directory) do
     raw_directory = Path.join(directory, "raw")
     canonical_directory = Path.join(directory, "canonical")
     output_directory = Path.join(directory, "output")
@@ -52,15 +59,15 @@ defmodule W3.Compactor do
     Enum.each([raw_directory, canonical_directory, output_directory], &File.mkdir_p!/1)
 
     try do
-      raw_files = download!(request, bucket, raw_keys, raw_directory, ".ndjson.zst")
+      raw_files = download!(s3, raw_keys, raw_directory, ".ndjson.zst")
 
       canonical_keys =
-        request
-        |> list_keys(bucket, "v1/year=")
+        s3
+        |> list_keys("v1/year=")
         |> Enum.filter(&String.ends_with?(&1, "/heartbeats.parquet"))
 
       canonical_files =
-        download!(request, bucket, canonical_keys, canonical_directory, ".parquet")
+        download!(s3, canonical_keys, canonical_directory, ".parquet")
 
       query!(sql(raw_files, canonical_files, output_directory))
 
@@ -73,8 +80,8 @@ defmodule W3.Compactor do
           Path.join(directory, file)
         end
 
-      Enum.each(outputs, &upload!(request, bucket, &1))
-      Enum.each(raw_keys, &delete!(request, bucket, &1))
+      Enum.each(outputs, &upload!(s3, &1))
+      Enum.each(raw_keys, &delete!(s3, &1))
       :ok
     after
       File.rm_rf!(directory)
@@ -253,7 +260,7 @@ defmodule W3.Compactor do
     """
   end
 
-  defp request(s3) do
+  defp req(s3) do
     Req.new(retry: :transient)
     |> ReqS3.attach(
       aws_sigv4: [
@@ -265,11 +272,11 @@ defmodule W3.Compactor do
     )
   end
 
-  defp list_keys(request, bucket, prefix) do
-    list_keys(request, bucket, prefix, nil, [])
+  defp list_keys(s3, prefix) do
+    list_keys(req(s3), s3.bucket, prefix, nil, [])
   end
 
-  defp list_keys(request, bucket, prefix, continuation_token, pages) do
+  defp list_keys(req, bucket, prefix, continuation_token, pages) do
     params = %{"list-type" => "2", "prefix" => prefix}
 
     params =
@@ -279,34 +286,36 @@ defmodule W3.Compactor do
         params
       end
 
-    response = Req.get!(request, url: "s3://#{bucket}", params: params) |> success!()
+    response = Req.get!(req, url: "s3://#{bucket}", params: params) |> success!()
     result = response.body["ListBucketResult"]
     page = Enum.map(result["Contents"] || [], &Map.fetch!(&1, "Key"))
     pages = [page | pages]
 
     if result["IsTruncated"] == "true" do
-      list_keys(request, bucket, prefix, Map.fetch!(result, "NextContinuationToken"), pages)
+      list_keys(req, bucket, prefix, Map.fetch!(result, "NextContinuationToken"), pages)
     else
       pages |> Enum.reverse() |> List.flatten()
     end
   end
 
-  defp download!(request, bucket, keys, directory, extension) do
+  defp download!(s3, keys, directory, extension) do
+    req = req(s3)
+
     keys
     |> Enum.with_index()
     |> Enum.map(fn {key, index} ->
-      response = Req.get!(request, url: "s3://#{bucket}/#{key}", raw: true) |> success!()
+      response = Req.get!(req, url: "s3://#{s3.bucket}/#{key}", raw: true) |> success!()
       path = Path.join(directory, "#{index}#{extension}")
       File.write!(path, response.body)
       path
     end)
   end
 
-  defp upload!(request, bucket, path) do
+  defp upload!(s3, path) do
     "year=" <> year = path |> Path.dirname() |> Path.basename()
 
-    Req.put!(request,
-      url: "s3://#{bucket}/v1/year=#{year}/heartbeats.parquet",
+    Req.put!(req(s3),
+      url: "s3://#{s3.bucket}/v1/year=#{year}/heartbeats.parquet",
       headers: %{"content-type" => "application/vnd.apache.parquet"},
       body: File.read!(path)
     )
@@ -315,8 +324,8 @@ defmodule W3.Compactor do
     :ok
   end
 
-  defp delete!(request, bucket, key) do
-    Req.delete!(request, url: "s3://#{bucket}/#{key}") |> success!()
+  defp delete!(s3, key) do
+    Req.delete!(req(s3), url: "s3://#{s3.bucket}/#{key}") |> success!()
     :ok
   end
 

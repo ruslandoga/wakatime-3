@@ -20,30 +20,35 @@ defmodule W3.PeriodicTest do
     assert_receive {:started, ^periodic}, 1_000
   end
 
-  test "runs repeatedly after an exception" do
-    test = self()
+  test "backs off after an exception and resets after success" do
+    backoff = W3.Backoff.new(base: 1, max: 1)
 
-    task = fn ->
-      run = Process.get(:run, 0) + 1
-      Process.put(:run, run)
-      send(test, {:run, self(), run})
+    assert {:keep_state_and_data, {:next_event, :internal, {:run, 2}}} =
+             W3.Periodic.handle_event({:timeout, :run}, 2, :no_state, :data)
 
-      if run == 1 do
-        raise "failed run"
-      end
-    end
+    assert {:keep_state_and_data, {{:timeout, :run}, 1, 3}} =
+             W3.Periodic.handle_event(
+               :internal,
+               {:run, 2},
+               :no_state,
+               {100, backoff, fn -> raise "failed run" end}
+             )
 
-    periodic = start_periodic(task)
-
-    assert_receive {:run, ^periodic, 1}, 1_000
-    assert_receive {:run, ^periodic, 2}, 1_000
-    assert Process.alive?(periodic)
+    assert {:keep_state_and_data, {{:timeout, :run}, 100, 0}} =
+             W3.Periodic.handle_event(
+               :internal,
+               {:run, 3},
+               :no_state,
+               {100, backoff, fn -> :ok end}
+             )
   end
 
   defp start_periodic(task) do
+    backoff = W3.Backoff.new(base: 1, max: 1)
+
     start_supervised!(%{
       id: make_ref(),
-      start: {W3.Periodic, :start_link, [{to_timeout(millisecond: 10), task}]}
+      start: {W3.Periodic, :start_link, [{10, backoff, task}]}
     })
   end
 end
