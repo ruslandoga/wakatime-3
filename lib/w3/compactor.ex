@@ -119,12 +119,18 @@ defmodule W3.Compactor do
       connection = DuckNIF.connect(database)
 
       try do
-        result = DuckNIF.query_dirty_io(connection, sql)
+        statement = DuckNIF.prepare(connection, sql)
 
         try do
-          :ok
+          result = DuckNIF.execute_prepared_dirty_io(statement)
+
+          try do
+            :ok
+          after
+            :ok = DuckNIF.destroy_result(result)
+          end
         after
-          :ok = DuckNIF.destroy_result(result)
+          :ok = DuckNIF.destroy_prepare(statement)
         end
       after
         :ok = DuckNIF.disconnect(connection)
@@ -150,8 +156,6 @@ defmodule W3.Compactor do
       end
 
     """
-    SET TimeZone = 'UTC';
-
     COPY (
       WITH raw_input AS (
         SELECT *

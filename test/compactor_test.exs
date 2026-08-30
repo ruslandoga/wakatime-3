@@ -186,6 +186,17 @@ defmodule W3.CompactorTest do
     credentials = Help.s3_credentials(:minio)
     suffix = "#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
     bucket = "w3-compact-restart-#{suffix}"
+    raw_key = "raw/retry.ndjson.zst"
+    canonical_key = "v1/year=2022/heartbeats.parquet"
+
+    :ok = Help.create_bucket(credentials, bucket)
+    request = Help.s3_req(credentials)
+    put_raw!(request, bucket, raw_key, [%{"entity" => "synthetic/failure.ex"}])
+
+    on_exit(fn ->
+      Req.delete(request, url: "s3://#{bucket}/#{raw_key}")
+      Req.delete(request, url: "s3://#{bucket}/#{canonical_key}")
+    end)
 
     telemetry_ref =
       Help.attach_telemetry([
@@ -204,12 +215,12 @@ defmodule W3.CompactorTest do
           )
 
         assert_receive {[:w3, :compact, :exception], ^telemetry_ref, %{duration: _},
-                        %{bucket: ^bucket, reason: %RuntimeError{}}},
+                        %{bucket: ^bucket, reason: %DuckNIF.Error{}}},
                        1_000
 
         assert Process.alive?(pid)
 
-        :ok = Help.create_bucket(credentials, bucket)
+        put_raw!(request, bucket, raw_key, [heartbeat(entity: "synthetic/recovered.ex")])
 
         assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: _},
                         %{bucket: ^bucket}},
@@ -220,6 +231,8 @@ defmodule W3.CompactorTest do
 
     assert log =~ "heartbeat compaction failed"
     assert log =~ "heartbeat compaction complete"
+    assert object_status(request, bucket, raw_key) == 404
+    assert object_status(request, bucket, canonical_key) == 200
   end
 
   @tag :minio
