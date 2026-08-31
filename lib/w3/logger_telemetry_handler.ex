@@ -34,25 +34,11 @@ defmodule W3.LoggerTelemetryHandler do
     end)
   end
 
-  def handle_event([:w3, :upload, :stop], measurements, %{result: :ok} = metadata, _config) do
+  def handle_event([:w3, :upload, :stop], measurements, metadata, _config) do
     Logger.info(fn ->
       "uploaded #{measurements.heartbeats} heartbeat(s) " <>
         "(#{measurements.bytes} compressed bytes) to " <>
         "s3://#{metadata.bucket}/#{metadata.key} in #{duration(measurements)}ms"
-    end)
-  end
-
-  def handle_event(
-        [:w3, :upload, :stop],
-        measurements,
-        %{result: {:error, reason}} = metadata,
-        _config
-      ) do
-    Logger.warning(fn ->
-      "failed to upload #{measurements.heartbeats} heartbeat(s) " <>
-        "(#{measurements.bytes} compressed bytes) to " <>
-        "s3://#{metadata.bucket}/#{metadata.key} after #{duration(measurements)}ms: " <>
-        format_reason(reason)
     end)
   end
 
@@ -82,7 +68,4 @@ defmodule W3.LoggerTelemetryHandler do
   defp format_error(%{kind: kind, reason: reason}) do
     Exception.format(kind, reason)
   end
-
-  defp format_reason(reason) when is_exception(reason), do: Exception.format(:error, reason)
-  defp format_reason(reason), do: inspect(reason)
 end

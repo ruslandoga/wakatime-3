@@ -1,21 +1,31 @@
 defmodule W3.Compactor do
   @moduledoc """
-  TODO
+  Converts pending raw heartbeat batches into flat, time-sorted Parquet files.
   """
 
   alias W3.{S3, Duck}
 
-  def compact_raw_files_into_parquet(s3) do
-    raw_keys =
-      s3
-      |> S3.list_objects("raw/")
-      |> Enum.filter(&String.ends_with?(&1, ".ndjson.zst"))
+  @upload_chunk_size 1024 * 1024
 
-    if raw_keys == [] do
-      :noop
-    else
-      compact_raw_files_into_parquet(s3, raw_keys)
-    end
+  def compact_raw_files_into_parquet(s3) do
+    metadata = %{bucket: s3.bucket}
+
+    :telemetry.span([:w3, :compact], metadata, fn ->
+      raw_keys =
+        s3
+        |> S3.list_objects("raw/")
+        |> Enum.filter(&String.ends_with?(&1, ".ndjson.zst"))
+        |> Enum.sort()
+
+      {result, measurements} =
+        if raw_keys == [] do
+          {:noop, %{raw_files: 0, raw_bytes: 0, rows: 0, parquet_bytes: 0}}
+        else
+          {:ok, compact_raw_files_into_parquet(s3, raw_keys)}
+        end
+
+      {result, measurements, metadata}
+    end)
   end
 
   defp compact_raw_files_into_parquet(s3, raw_keys) do
@@ -24,15 +34,18 @@ defmodule W3.Compactor do
     raw_paths =
       raw_keys
       |> Enum.map(fn key ->
-        # we can't generate random_file in async_map because it will be called in a different process and the file will be deleted when the process exits, so we generate the random_file here and pass it to async_map
+        # Plug deletes files when their owner exits, so the parent task owns each download.
         %{key: key, path: Plug.Upload.random_file!("raw")}
       end)
       |> W3.async_map!(
         fn %{key: key, path: path} ->
-          %{status: 200, body: body} =
-            Req.get!(base_req, url: "s3://#{s3.bucket}/#{key}", raw: true)
+          %{status: 200} =
+            Req.get!(base_req,
+              url: S3.object_url(s3, key),
+              into: File.stream!(path, [:delayed_write]),
+              raw: true
+            )
 
-          File.write!(path, body)
           path
         end,
         ordered: false,
@@ -40,27 +53,61 @@ defmodule W3.Compactor do
         max_concurrency: System.schedulers_online() * 4
       )
 
-    parquet_path = Plug.Upload.random_file!("raw")
-    copy_raw_to_parquet(raw_paths, parquet_path)
+    raw_bytes = Enum.sum_by(raw_paths, &File.stat!(&1).size)
+    parquet_path = Plug.Upload.random_file!("parquet")
+    row_count = copy_raw_to_parquet(raw_paths, parquet_path)
 
-    %{status: 200} =
-      Req.put!(base_req,
-        url: "s3://#{s3.bucket}/processed/#{Path.basename(parquet_path)}",
-        headers: %{"content-type" => "application/vnd.apache.parquet"},
-        body: File.read!(parquet_path)
-      )
+    parquet_bytes =
+      if row_count > 0 do
+        parquet_bytes = File.stat!(parquet_path).size
+        processed_key = processed_key(raw_keys)
+
+        %{status: 200} =
+          Req.put!(
+            base_req,
+            url: S3.object_url(s3, processed_key),
+            body: File.stream!(parquet_path, @upload_chunk_size, read_ahead: @upload_chunk_size),
+            headers: %{
+              "content-length" => Integer.to_string(parquet_bytes),
+              "content-type" => "application/vnd.apache.parquet"
+            }
+          )
+
+        parquet_bytes
+      else
+        0
+      end
 
     S3.delete_objects!(s3, raw_keys)
 
-    :ok
+    %{
+      raw_files: length(raw_keys),
+      raw_bytes: raw_bytes,
+      rows: row_count,
+      parquet_bytes: parquet_bytes
+    }
+  end
+
+  defp processed_key(raw_keys) do
+    id =
+      raw_keys
+      |> Enum.sort()
+      |> JSON.encode_to_iodata!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    "processed/#{id}.parquet"
   end
 
   def copy_raw_to_parquet(raw_paths, parquet_path) do
     Duck.with_duck(fn conn ->
-      Duck.query(
-        conn,
-        """
-        COPY (
+      Duck.query(conn, "SET temp_directory = #{Duck.quote(Path.dirname(parquet_path))}")
+
+      %{"Count" => [row_count]} =
+        Duck.query(
+          conn,
+          """
+          COPY (
           WITH raw_input AS (
             SELECT *
             FROM read_ndjson(
@@ -128,16 +175,18 @@ defmodule W3.Compactor do
           )
           SELECT *
           FROM event
-          ORDER BY year, time, entity
-        ) TO #{Duck.quote(parquet_path)} (
+          ORDER BY time, entity
+          ) TO #{Duck.quote(parquet_path)} (
           FORMAT PARQUET,
           COMPRESSION ZSTD,
           PARQUET_VERSION V2,
           ROW_GROUP_SIZE 8192
+          )
+          """,
+          %{"raw_paths" => JSON.encode!(raw_paths)}
         )
-        """,
-        %{"raw_paths" => JSON.encode!(raw_paths)}
-      )
+
+      row_count
     end)
   end
 end

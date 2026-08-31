@@ -26,7 +26,9 @@ RUN apk add --no-cache \
     ncurses-libs \
     openssl \
     && addgroup --system w3 \
-    && adduser --system --disabled-password --uid 999 --ingroup w3 --home /app w3
+    && adduser --system --disabled-password --uid 999 --ingroup w3 --home /app w3 \
+    && mkdir -p /data \
+    && chown w3:w3 /data
 
 WORKDIR /app
 
@@ -35,6 +37,7 @@ COPY --from=build --chown=w3:w3 /app/_build/prod/rel/w3 ./
 USER w3
 
 ENV HOME=/app \
-    LANG=C.UTF-8
+    LANG=C.UTF-8 \
+    TMPDIR=/data
 
 CMD ["/app/bin/w3", "start"]

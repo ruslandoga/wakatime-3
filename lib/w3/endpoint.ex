@@ -84,18 +84,13 @@ defmodule W3.Endpoint do
     %{body_params: %{"_json" => heartbeats}, private: %{s3: s3}} = conn
     [machine_name] = get_req_header(conn, "x-machine-name")
 
-    case W3.Ingester.insert_heartbeats(s3, heartbeats, URI.decode_www_form(machine_name)) do
-      :ok ->
-        json =
-          JSON.encode_to_iodata!(%{"responses" => Enum.map(heartbeats, fn _ -> [nil, 201] end)})
+    :ok = W3.Ingester.insert_heartbeats(s3, heartbeats, URI.decode_www_form(machine_name))
 
-        conn
-        |> put_resp_header("content-type", "application/json; charset=utf-8")
-        |> send_resp(201, json)
+    json = JSON.encode_to_iodata!(%{"responses" => Enum.map(heartbeats, fn _ -> [nil, 201] end)})
 
-      {:error, _reason} ->
-        send_resp(conn, 503, "service unavailable")
-    end
+    conn
+    |> put_resp_header("content-type", "application/json; charset=utf-8")
+    |> send_resp(201, json)
   end
 
   @doc false

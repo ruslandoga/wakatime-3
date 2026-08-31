@@ -45,7 +45,7 @@ defmodule W3.Periodic do
   end
 
   def handle_event(:internal, {:start, failure_count}, :idle, config) do
-    # we run it in a task to simplify resource management (memory, tmp_dir from plug.upload, etc.)
+    # A fresh task releases its process memory and temporary-file/stream resources after each run.
     task = Task.Supervisor.async_nolink(W3.task_supervisor(), config.task)
     {:next_state, {:busy, task.ref, failure_count}, config}
   end

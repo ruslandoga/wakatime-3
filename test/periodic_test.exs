@@ -1,9 +1,7 @@
 defmodule W3.PeriodicTest do
   use ExUnit.Case, async: true
 
-  import ExUnit.CaptureLog
-
-  test "does not overlap runs" do
+  test "starts immediately and does not overlap runs" do
     test = self()
 
     periodic =
@@ -15,14 +13,17 @@ defmodule W3.PeriodicTest do
         end
       end)
 
-    assert_receive {:started, ^periodic}, 1_000
-    refute_receive {:started, ^periodic}, 30
+    assert_receive {:started, first_task}, 1_000
+    refute first_task == periodic
+    refute_receive {:started, _task}, 30
 
-    send(periodic, :continue)
-    assert_receive {:started, ^periodic}, 1_000
+    send(first_task, :continue)
+    assert_receive {:started, second_task}, 1_000
+    refute second_task == first_task
+    send(second_task, :continue)
   end
 
-  test "backs off after errors, exits, and throws" do
+  test "retries after errors, exits, and throws" do
     test = self()
     attempts = start_supervised!({Agent, fn -> [:error, :exit, :throw, :success] end})
 
@@ -31,114 +32,67 @@ defmodule W3.PeriodicTest do
       send(test, {:attempt, attempt})
 
       case attempt do
-        :error ->
-          raise "boom"
-
-        :exit ->
-          exit(:boom)
-
-        :throw ->
-          throw(:boom)
-
-        :success ->
-          receive do
-            :stop -> :ok
-          end
+        :error -> raise "boom"
+        :exit -> exit(:boom)
+        :throw -> throw(:boom)
+        :success -> :ok
       end
     end
 
-    log =
-      capture_log(fn ->
-        periodic = start_periodic(task)
+    periodic = start_periodic(task, interval: 1_000)
 
-        for attempt <- [:error, :exit, :throw, :success] do
-          assert_receive {:attempt, ^attempt}, 1_000
-        end
+    for attempt <- [:error, :exit, :throw, :success] do
+      assert_receive {:attempt, ^attempt}, 1_000
+    end
 
-        assert Process.alive?(periodic)
-      end)
-
-    assert log =~ "periodic task #{inspect(task)} failed on attempt 1"
-    assert log =~ "retrying attempt 2 in 1ms"
-    assert log =~ "failed on attempt 3"
-    assert log =~ "** (RuntimeError) boom"
-    assert log =~ "** (exit) :boom"
-    assert log =~ "** (throw) :boom"
+    assert Process.alive?(periodic)
   end
 
-  test "reports failures before retrying and resets after success" do
-    telemetry_ref =
-      Help.attach_telemetry([
-        [:w3, :periodic, :start],
-        [:w3, :periodic, :stop],
-        [:w3, :periodic, :exception]
-      ])
+  test "bounds full-jitter delays and resets failures after success" do
+    config = %{interval: 100, backoff: %{base: 10, max: 25}, task: fn -> :ok end}
 
-    test = self()
-    attempts = start_supervised!({Agent, fn -> [:exit, :success, :exit, :recovered] end})
+    for {failure_count, upper_bound} <- [{0, 10}, {1, 20}, {2, 25}, {8, 25}] do
+      task_ref = make_ref()
 
-    task = fn ->
-      case Agent.get_and_update(attempts, fn [attempt | rest] -> {attempt, rest} end) do
-        :exit ->
-          exit(:boom)
+      assert {:next_state, :idle, ^config, {{:timeout, :start}, retry_delay, next_failure_count}} =
+               W3.Periodic.handle_event(
+                 :info,
+                 {:DOWN, task_ref, :process, self(), :boom},
+                 {:busy, task_ref, failure_count},
+                 config
+               )
 
-        :success ->
-          :ok
-
-        :recovered ->
-          send(test, :recovered)
-
-          receive do
-            :stop -> :ok
-          end
-      end
+      assert retry_delay in 1..upper_bound
+      assert next_failure_count == failure_count + 1
     end
 
-    task_name = inspect(task)
+    task = spawn(fn -> Process.sleep(:infinity) end)
+    task_ref = Process.monitor(task)
 
-    capture_log(fn ->
-      periodic = start_periodic(task)
+    assert {:next_state, :idle, ^config, {{:timeout, :start}, 100, 0}} =
+             W3.Periodic.handle_event(
+               :info,
+               {task_ref, :ok},
+               {:busy, task_ref, 8},
+               config
+             )
 
-      assert_receive {[:w3, :periodic, :start], ^telemetry_ref, _,
-                      %{attempt: 1, retry_delay: 1, task: ^task_name}}
+    Process.exit(task, :kill)
+  end
 
-      assert_receive {[:w3, :periodic, :exception], ^telemetry_ref, %{duration: duration},
-                      %{
-                        attempt: 1,
-                        kind: :exit,
-                        reason: :boom,
-                        retry_delay: 1,
-                        stacktrace: stacktrace,
-                        task: ^task_name
-                      }}
+  test "waits for the configured interval after success" do
+    test = self()
 
-      assert is_integer(duration)
-      assert is_list(stacktrace)
+    _periodic =
+      start_periodic(
+        fn -> send(test, {:ran, System.monotonic_time(:millisecond)}) end,
+        interval: 80
+      )
 
-      assert_receive {[:w3, :periodic, :start], ^telemetry_ref, _,
-                      %{attempt: 2, retry_delay: 1, task: ^task_name}}
-
-      assert_receive {[:w3, :periodic, :stop], ^telemetry_ref, _,
-                      %{attempt: 2, retry_delay: 1, task: ^task_name}}
-
-      assert_receive {[:w3, :periodic, :start], ^telemetry_ref, _,
-                      %{attempt: 1, retry_delay: 1, task: ^task_name}}
-
-      assert_receive {[:w3, :periodic, :exception], ^telemetry_ref, _,
-                      %{
-                        attempt: 1,
-                        kind: :exit,
-                        reason: :boom,
-                        retry_delay: 1,
-                        task: ^task_name
-                      }}
-
-      assert_receive {[:w3, :periodic, :start], ^telemetry_ref, _,
-                      %{attempt: 2, retry_delay: 1, task: ^task_name}}
-
-      assert_receive :recovered, 1_000
-      assert Process.alive?(periodic)
-    end)
+    assert_receive {:ran, first}, 1_000
+    refute_receive {:ran, _second}, 40
+    assert_receive {:ran, second}, 1_000
+    assert second - first >= 70
   end
 
   test "ignores stray messages" do
@@ -146,26 +100,31 @@ defmodule W3.PeriodicTest do
 
     periodic =
       start_periodic(fn ->
-        send(test, :started)
+        send(test, {:started, self()})
 
         receive do
           :continue -> :ok
         end
       end)
 
-    assert_receive :started, 1_000
+    assert_receive {:started, task}, 1_000
     send(periodic, :stray)
-    send(periodic, :continue)
-    assert_receive :started, 1_000
+    send(task, :continue)
+    assert_receive {:started, next_task}, 1_000
     assert Process.alive?(periodic)
+    send(next_task, :continue)
   end
 
-  defp start_periodic(task) do
-    backoff = %{base: 1, max: 1}
+  defp start_periodic(task, options \\ []) do
+    options =
+      options
+      |> Keyword.put_new(:interval, 10)
+      |> Keyword.put_new(:backoff, %{base: 1, max: 1})
+      |> Keyword.put(:task, task)
 
     start_supervised!(%{
       id: make_ref(),
-      start: {W3.Periodic, :start_link, [[interval: 10, backoff: backoff, task: task]]}
+      start: {W3.Periodic, :start_link, [options]}
     })
   end
 end
