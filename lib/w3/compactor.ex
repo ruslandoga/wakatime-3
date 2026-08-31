@@ -47,7 +47,7 @@ defmodule W3.Compactor do
             )
 
           unless response.status == 200 do
-            raise "failed to download #{key}: #{S3.response_error(response)}"
+            raise "failed to download #{key}: HTTP #{response.status}"
           end
 
           path
@@ -76,7 +76,7 @@ defmodule W3.Compactor do
         )
 
       unless response.status in 200..299 do
-        raise "failed to upload #{processed_key}: #{S3.response_error(response)}"
+        raise "failed to upload #{processed_key}: HTTP #{response.status}"
       end
     end
 

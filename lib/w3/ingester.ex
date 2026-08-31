@@ -50,7 +50,7 @@ defmodule W3.Ingester do
 
     case response do
       {:ok, %{status: status}} when status in 200..299 -> :ok
-      {:ok, response} -> {:error, S3.response_error(response)}
+      {:ok, %{status: status}} -> {:error, {:http_error, status}}
       {:error, reason} -> {:error, reason}
     end
   end

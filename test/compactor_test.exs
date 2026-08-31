@@ -109,12 +109,13 @@ defmodule W3.CompactorTest do
              """
              SELECT entity, is_write, year(timezone('UTC', time)) AS year
              FROM read_parquet(
-               '#{parquet}',
+               $parquet,
                file_row_number = true,
                hive_partitioning = false
              )
              ORDER BY file_row_number
-             """
+             """,
+             %{"parquet" => parquet}
            ) == %{
              "entity" => ["synthetic/first.ex", "synthetic/new.ex", "synthetic/late.ex"],
              "is_write" => [false, true, false],
@@ -305,7 +306,7 @@ defmodule W3.CompactorTest do
     assert object_keys(request, bucket, "processed/") == []
   end
 
-  test "includes a failed S3 response in the error", %{s3: s3} do
+  test "includes a failed S3 status in the error", %{s3: s3} do
     missing_bucket = "#{s3.bucket}-missing"
     s3 = %{s3 | bucket: missing_bucket}
 
@@ -319,7 +320,6 @@ defmodule W3.CompactorTest do
     assert log =~ "heartbeat compaction failed"
     assert log =~ missing_bucket
     assert log =~ "HTTP 404"
-    assert log =~ "NoSuchBucket"
   end
 
   defp heartbeat(options) do

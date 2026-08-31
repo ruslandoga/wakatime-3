@@ -3,26 +3,8 @@ defmodule W3.S3 do
 
   defimpl Inspect, for: W3.S3 do
     def inspect(s3, _opts) do
-      "#S3<bucket=#{s3.bucket}, region=#{s3.region}>"
+      "#S3<bucket=#{s3.bucket}, region=#{s3.region}, endpoint_url=#{s3.endpoint_url}>"
     end
-  end
-
-  def response_error(%Req.Response{status: status, body: body, headers: headers}) do
-    error = error_fields(body)
-
-    code = safe_error_field(error["Code"])
-
-    request_id =
-      safe_error_field(error["RequestId"]) ||
-        safe_error_field(headers["x-amz-request-id"] |> List.wrap() |> List.first())
-
-    [
-      "HTTP ",
-      Integer.to_string(status),
-      if(code, do: [": ", code], else: []),
-      if(request_id, do: [" (request ", request_id, ")"], else: [])
-    ]
-    |> IO.iodata_to_binary()
   end
 
   def delete_objects!(s3, keys) do
@@ -52,14 +34,12 @@ defmodule W3.S3 do
         )
 
       unless response.status == 200 do
-        raise "failed to delete S3 objects: #{response_error(response)}"
+        raise "failed to delete S3 objects: HTTP #{response.status}"
       end
 
       case ReqS3.XML.parse_s3(response.body) do
         %{"DeleteResult" => nil} -> :ok
-        %{"DeleteResult" => %{"Error" => nil}} -> :ok
-        %{"DeleteResult" => _result} -> raise "S3 object deletion returned errors"
-        _response -> raise "invalid S3 object deletion response"
+        %{"DeleteResult" => result} -> nil = result["Error"]
       end
     end)
   end
@@ -86,7 +66,7 @@ defmodule W3.S3 do
     result =
       case response do
         %{status: 200, body: %{"ListBucketResult" => result}} -> result
-        _ -> raise "failed to list S3 objects: #{response_error(response)}"
+        %{status: status} -> raise "failed to list S3 objects: HTTP #{status}"
       end
 
     page = Enum.map(result["Contents"] || [], &Map.fetch!(&1, "Key"))
@@ -126,25 +106,4 @@ defmodule W3.S3 do
   defp maybe_put(map, key, value) do
     if value, do: Map.put(map, key, value), else: map
   end
-
-  defp safe_error_field(value) when is_binary(value) and byte_size(value) <= 256 do
-    if String.match?(value, ~r/\A[[:alnum:].:_-]+\z/), do: value
-  end
-
-  defp safe_error_field(_value), do: nil
-
-  defp error_fields(%{"Error" => %{} = error}), do: error
-  defp error_fields(%{} = error), do: error
-
-  defp error_fields(body) when is_binary(body) do
-    body
-    |> ReqS3.XML.parse_s3()
-    |> error_fields()
-  rescue
-    _error -> %{}
-  catch
-    _kind, _reason -> %{}
-  end
-
-  defp error_fields(_body), do: %{}
 end
