@@ -17,14 +17,14 @@ defmodule W3.Compactor do
         |> Enum.filter(&String.ends_with?(&1, ".ndjson.zst"))
         |> Enum.sort()
 
-      result =
+      {result, measurements} =
         if raw_keys == [] do
-          :noop
+          {:noop, %{raw_files: 0, raw_bytes: 0, rows: 0, parquet_bytes: 0}}
         else
-          compact_raw_files_into_parquet(s3, raw_keys)
+          {:ok, compact_raw_files_into_parquet(s3, raw_keys)}
         end
 
-      {result, metadata}
+      {result, measurements, metadata}
     end)
   end
 
@@ -39,16 +39,12 @@ defmodule W3.Compactor do
       end)
       |> W3.async_map!(
         fn %{key: key, path: path} ->
-          response =
+          %{status: 200} =
             Req.get!(base_req,
               url: S3.object_url(s3, key),
               into: File.stream!(path, [:delayed_write]),
               raw: true
             )
-
-          unless response.status == 200 do
-            raise "failed to download #{key}: HTTP #{response.status}"
-          end
 
           path
         end,
@@ -57,32 +53,39 @@ defmodule W3.Compactor do
         max_concurrency: System.schedulers_online() * 4
       )
 
+    raw_bytes = Enum.sum_by(raw_paths, &File.stat!(&1).size)
     parquet_path = Plug.Upload.random_file!("parquet")
     row_count = copy_raw_to_parquet(raw_paths, parquet_path)
 
-    if row_count > 0 do
-      parquet_size = File.stat!(parquet_path).size
-      processed_key = processed_key(raw_keys)
+    parquet_bytes =
+      if row_count > 0 do
+        parquet_bytes = File.stat!(parquet_path).size
+        processed_key = processed_key(raw_keys)
 
-      response =
-        Req.put!(
-          base_req,
-          url: S3.object_url(s3, processed_key),
-          body: File.stream!(parquet_path, @upload_chunk_size, read_ahead: @upload_chunk_size),
-          headers: %{
-            "content-length" => Integer.to_string(parquet_size),
-            "content-type" => "application/vnd.apache.parquet"
-          }
-        )
+        %{status: 200} =
+          Req.put!(
+            base_req,
+            url: S3.object_url(s3, processed_key),
+            body: File.stream!(parquet_path, @upload_chunk_size, read_ahead: @upload_chunk_size),
+            headers: %{
+              "content-length" => Integer.to_string(parquet_bytes),
+              "content-type" => "application/vnd.apache.parquet"
+            }
+          )
 
-      unless response.status in 200..299 do
-        raise "failed to upload #{processed_key}: HTTP #{response.status}"
+        parquet_bytes
+      else
+        0
       end
-    end
 
     S3.delete_objects!(s3, raw_keys)
 
-    :ok
+    %{
+      raw_files: length(raw_keys),
+      raw_bytes: raw_bytes,
+      rows: row_count,
+      parquet_bytes: parquet_bytes
+    }
   end
 
   defp processed_key(raw_keys) do
@@ -93,7 +96,7 @@ defmodule W3.Compactor do
       |> then(&:crypto.hash(:sha256, &1))
       |> Base.encode16(case: :lower)
 
-    "processed/batch-#{id}.parquet"
+    "processed/#{id}.parquet"
   end
 
   def copy_raw_to_parquet(raw_paths, parquet_path) do

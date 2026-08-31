@@ -20,7 +20,7 @@ defmodule W3.S3 do
           "<Quiet>true</Quiet></Delete>"
         ])
 
-      response =
+      %{status: 200, body: response_body} =
         s3
         |> base_req()
         |> Req.post!(
@@ -33,11 +33,7 @@ defmodule W3.S3 do
           body: body
         )
 
-      unless response.status == 200 do
-        raise "failed to delete S3 objects: HTTP #{response.status}"
-      end
-
-      case ReqS3.XML.parse_s3(response.body) do
+      case ReqS3.XML.parse_s3(response_body) do
         %{"DeleteResult" => nil} -> :ok
         %{"DeleteResult" => result} -> nil = result["Error"]
       end
@@ -61,13 +57,8 @@ defmodule W3.S3 do
       |> maybe_put("prefix", prefix)
       |> maybe_put("continuation-token", continuation_token)
 
-    response = Req.get!(base_req, url: "s3://#{bucket}", params: params)
-
-    result =
-      case response do
-        %{status: 200, body: %{"ListBucketResult" => result}} -> result
-        %{status: status} -> raise "failed to list S3 objects: HTTP #{status}"
-      end
+    %{status: 200, body: %{"ListBucketResult" => result}} =
+      Req.get!(base_req, url: "s3://#{bucket}", params: params)
 
     page = Enum.map(result["Contents"] || [], &Map.fetch!(&1, "Key"))
     acc = [page | acc]
@@ -87,7 +78,7 @@ defmodule W3.S3 do
       region: region
     } = s3
 
-    Req.new(retry: :transient)
+    Req.new(retry: :transient, http_errors: :raise)
     |> ReqS3.attach(
       aws_sigv4: [
         region: region,

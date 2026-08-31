@@ -11,7 +11,8 @@ For each bulk request, it:
 3. Uploads it to a content-addressed `raw/<sha256>.ndjson.zst` key.
 4. Returns WakaTime's expected `201` only after object storage accepts the upload.
 
-An upload failure returns `503`, allowing WakaTime's offline queue and backoff to retry.
+An upload failure propagates as a server error, allowing WakaTime's offline queue and backoff to
+retry.
 
 ## Run
 
@@ -23,7 +24,6 @@ docker run --detach \
   --publish 6767:6767 \
   --volume w3_tmp:/data \
   -e HTTP_PORT=6767 \
-  -e TMPDIR=/data \
   -e API_KEY=your-wakatime-shaped-api-key \
   -e AWS_S3_BUCKET=w3 \
   -e AWS_REGION=auto \
@@ -32,6 +32,10 @@ docker run --detach \
   -e AWS_SECRET_ACCESS_KEY=your-r2-secret-access-key \
   ghcr.io/ruslandoga/wakatime-3:latest
 ```
+
+The image defaults `TMPDIR` to `/data`. The shown volume keeps compaction I/O out of Docker's
+writable container layer; without it, compaction still works, but its temporary files use that
+ephemeral layer.
 
 The credentials need permission to list the bucket and to read, write, and delete its objects. Keep
 the bucket private: raw and processed data contain file paths, project and branch names, and machine
@@ -52,13 +56,13 @@ Raw and processed objects share the configured bucket. Processed data is flat, n
 
 ```text
 raw/<sha256-of-enriched-ndjson>.ndjson.zst
-processed/batch-<sha256-of-sorted-raw-keys>.parquet
+processed/<sha256-of-sorted-raw-keys>.parquet
 ```
 
 The compactor runs at startup and then 30 minutes after each successful run. It snapshots `raw/`,
 downloads those objects concurrently, converts valid events into one Parquet file, uploads it, and
 only then deletes the snapshotted raw objects. New raw objects wait for the next run. A deterministic
-batch key makes a retry of the same snapshot overwrite the same object.
+key makes a retry of the same snapshot overwrite the same object.
 
 Rows missing `time`, `entity`, `type`, or `machine_name` are discarded; an all-invalid snapshot
 produces no Parquet object. Malformed typed values fail the compaction and leave its raw snapshot
@@ -67,8 +71,8 @@ available for inspection or retry. Failures use full-jitter exponential backoff 
 
 Parquet files use UTC `TIMESTAMPTZ`, Parquet V2, Zstandard compression, and a target row-group size of
 8,192 rows. Rows are ordered by `time`, then `entity`, so bounded time predicates can prune row groups
-using Parquet min/max statistics. Temporary files live under `TMPDIR` (`/tmp` by default) and are
-removed when the compaction task exits.
+using Parquet min/max statistics. Temporary files live under `TMPDIR` (`/data` in the container
+image) and are removed when the compaction task exits.
 
 ## Query
 

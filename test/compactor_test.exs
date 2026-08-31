@@ -77,6 +77,10 @@ defmodule W3.CompactorTest do
     put_raw!(request, bucket, first_raw_key, [late, first])
     put_raw!(request, bucket, second_raw_key, [new, first])
 
+    raw_bytes =
+      byte_size(object_body(request, bucket, first_raw_key)) +
+        byte_size(object_body(request, bucket, second_raw_key))
+
     telemetry_ref =
       Help.attach_telemetry([
         [:w3, :compact, :start],
@@ -90,10 +94,17 @@ defmodule W3.CompactorTest do
 
     assert_receive {[:w3, :compact, :start], ^telemetry_ref, _, %{bucket: ^bucket}}
 
-    assert_receive {[:w3, :compact, :stop], ^telemetry_ref, %{duration: duration},
-                    %{bucket: ^bucket}}
+    assert_receive {[:w3, :compact, :stop], ^telemetry_ref,
+                    %{
+                      duration: duration,
+                      raw_files: 2,
+                      raw_bytes: ^raw_bytes,
+                      rows: 3,
+                      parquet_bytes: parquet_bytes
+                    }, %{bucket: ^bucket}}
 
     assert is_integer(duration)
+    assert parquet_bytes > 0
     assert log =~ "heartbeat compaction complete"
     assert log =~ bucket
 
@@ -306,20 +317,23 @@ defmodule W3.CompactorTest do
     assert object_keys(request, bucket, "processed/") == []
   end
 
-  test "includes a failed S3 status in the error", %{s3: s3} do
+  test "includes a failed S3 response body in the error", %{s3: s3} do
     missing_bucket = "#{s3.bucket}-missing"
     s3 = %{s3 | bucket: missing_bucket}
 
     log =
       capture_log(fn ->
-        assert_raise RuntimeError, fn ->
-          W3.Compactor.compact_raw_files_into_parquet(s3)
-        end
+        assert_raise RuntimeError,
+                     ~r/requested URL returned error: 404.*Response body:.*NoSuchBucket/s,
+                     fn ->
+                       W3.Compactor.compact_raw_files_into_parquet(s3)
+                     end
       end)
 
     assert log =~ "heartbeat compaction failed"
     assert log =~ missing_bucket
-    assert log =~ "HTTP 404"
+    assert log =~ "requested URL returned error: 404"
+    assert log =~ "NoSuchBucket"
   end
 
   defp heartbeat(options) do
@@ -393,7 +407,7 @@ defmodule W3.CompactorTest do
       |> then(&:crypto.hash(:sha256, &1))
       |> Base.encode16(case: :lower)
 
-    "processed/batch-#{id}.parquet"
+    "processed/#{id}.parquet"
   end
 
   defp object_url(bucket, key) do

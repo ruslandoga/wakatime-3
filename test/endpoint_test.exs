@@ -104,7 +104,7 @@ defmodule W3.EndpointTest do
 
       assert_receive {[:w3, :upload, :stop], ^telemetry_ref,
                       %{heartbeats: 1, bytes: bytes, duration: duration},
-                      %{bucket: ^bucket, key: key, result: :ok}}
+                      %{bucket: ^bucket, key: key}}
 
       assert bytes > 0
       assert logs =~ "uploaded 1 heartbeat(s)"
@@ -176,28 +176,39 @@ defmodule W3.EndpointTest do
     end
 
     @tag :missing_bucket
-    test "returns 503 when S3 rejects the upload", %{req: req, bucket: bucket} do
-      telemetry_ref = Help.attach_telemetry([[:w3, :upload, :stop]])
+    test "raises with the S3 response when the upload fails", %{req: req, bucket: bucket} do
+      telemetry_ref = Help.attach_telemetry([[:w3, :upload, :exception]])
 
       logs =
         ExUnit.CaptureLog.capture_log(fn ->
-          assert %{status: 503, body: "service unavailable"} =
-                   Req.post!(req, body: JSON.encode_to_iodata!([Help.heartbeat()]))
+          assert %{status: 500} =
+                   Req.post!(req,
+                     body: JSON.encode_to_iodata!([Help.heartbeat()]),
+                     retry: false
+                   )
         end)
 
-      assert_receive {[:w3, :upload, :stop], ^telemetry_ref,
-                      %{heartbeats: 1, bytes: bytes, duration: duration},
+      assert_receive {[:w3, :upload, :exception], ^telemetry_ref, %{duration: duration},
                       %{
                         bucket: ^bucket,
                         key: key,
-                        result: {:error, {:http_error, 404}}
+                        heartbeats: 1,
+                        bytes: bytes,
+                        kind: :error,
+                        reason: %RuntimeError{} = reason,
+                        stacktrace: stacktrace
                       }}
 
+      assert is_list(stacktrace)
+      assert Exception.message(reason) =~ "requested URL returned error: 404"
+      assert Exception.message(reason) =~ "Response body:"
+      assert Exception.message(reason) =~ "NoSuchBucket"
       assert logs =~ "failed to upload 1 heartbeat(s)"
       assert logs =~ "#{bytes} compressed bytes"
       assert logs =~ "#{System.convert_time_unit(duration, :native, :millisecond)}ms"
       assert logs =~ "s3://#{bucket}/#{key}"
-      assert logs =~ "HTTP 404"
+      assert logs =~ "requested URL returned error: 404"
+      assert logs =~ "NoSuchBucket"
     end
   end
 

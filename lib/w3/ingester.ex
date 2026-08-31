@@ -29,17 +29,17 @@ defmodule W3.Ingester do
     }
 
     :telemetry.span([:w3, :upload], metadata, fn ->
-      result = upload(s3, key, body)
+      upload!(s3, key, body)
       measurements = %{heartbeats: heartbeat_count, bytes: byte_count}
-      {result, measurements, Map.put(metadata, :result, result)}
+      {:ok, measurements, metadata}
     end)
   end
 
-  defp upload(s3, key, body) do
-    response =
+  defp upload!(s3, key, body) do
+    %{status: 200} =
       s3
       |> S3.base_req()
-      |> Req.put(
+      |> Req.put!(
         headers: %{
           "content-encoding" => "zstd",
           "content-type" => "application/x-ndjson"
@@ -48,10 +48,6 @@ defmodule W3.Ingester do
         body: body
       )
 
-    case response do
-      {:ok, %{status: status}} when status in 200..299 -> :ok
-      {:ok, %{status: status}} -> {:error, {:http_error, status}}
-      {:error, reason} -> {:error, reason}
-    end
+    :ok
   end
 end
