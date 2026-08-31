@@ -13,7 +13,8 @@ defmodule W3.Periodic do
   end
 
   def child_spec(options) do
-    %{id: __MODULE__, start: {__MODULE__, :start_link, [options]}}
+    {id, options} = Keyword.pop(options, :id, __MODULE__)
+    %{id: id, start: {__MODULE__, :start_link, [options]}}
   end
 
   @impl :gen_statem

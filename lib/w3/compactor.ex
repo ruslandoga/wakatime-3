@@ -1,6 +1,7 @@
 defmodule W3.Compactor do
   @moduledoc """
-  Converts pending raw heartbeat batches into flat, time-sorted Parquet files.
+  Converts pending raw heartbeat batches into flat, time-sorted Parquet files
+  and periodically consolidates those Parquet files.
   """
 
   alias W3.{S3, Duck}
@@ -8,7 +9,7 @@ defmodule W3.Compactor do
   @upload_chunk_size 1024 * 1024
 
   def compact_raw_files_into_parquet(s3) do
-    metadata = %{bucket: s3.bucket}
+    metadata = %{bucket: s3.bucket, job: :raw}
 
     :telemetry.span([:w3, :compact], metadata, fn ->
       raw_keys =
@@ -28,30 +29,31 @@ defmodule W3.Compactor do
     end)
   end
 
+  def compact_parquet_files_into_one(s3) do
+    metadata = %{bucket: s3.bucket, job: :parquet}
+
+    :telemetry.span([:w3, :compact], metadata, fn ->
+      parquet_keys =
+        s3
+        |> S3.list_objects("processed/")
+        |> Enum.filter(&String.ends_with?(&1, ".parquet"))
+        |> Enum.sort()
+
+      {result, measurements} =
+        if length(parquet_keys) < 2 do
+          {:noop,
+           %{parquet_files: length(parquet_keys), parquet_bytes: 0, rows: 0, output_bytes: 0}}
+        else
+          {:ok, compact_parquet_files_into_one(s3, parquet_keys)}
+        end
+
+      {result, measurements, metadata}
+    end)
+  end
+
   defp compact_raw_files_into_parquet(s3, raw_keys) do
     base_req = S3.base_req(s3)
-
-    raw_paths =
-      raw_keys
-      |> Enum.map(fn key ->
-        # Plug deletes files when their owner exits, so the parent task owns each download.
-        %{key: key, path: Plug.Upload.random_file!("raw")}
-      end)
-      |> W3.async_map!(
-        fn %{key: key, path: path} ->
-          %{status: 200} =
-            Req.get!(base_req,
-              url: S3.object_url(s3, key),
-              into: File.stream!(path, [:delayed_write]),
-              raw: true
-            )
-
-          path
-        end,
-        ordered: false,
-        timeout: to_timeout(second: 30),
-        max_concurrency: System.schedulers_online() * 4
-      )
+    raw_paths = download_objects(base_req, s3, raw_keys, "raw", to_timeout(second: 30))
 
     raw_bytes = Enum.sum_by(raw_paths, &File.stat!(&1).size)
     parquet_path = Plug.Upload.random_file!("parquet")
@@ -62,16 +64,7 @@ defmodule W3.Compactor do
         parquet_bytes = File.stat!(parquet_path).size
         processed_key = processed_key(raw_keys)
 
-        %{status: 200} =
-          Req.put!(
-            base_req,
-            url: S3.object_url(s3, processed_key),
-            body: File.stream!(parquet_path, @upload_chunk_size, read_ahead: @upload_chunk_size),
-            headers: %{
-              "content-length" => Integer.to_string(parquet_bytes),
-              "content-type" => "application/vnd.apache.parquet"
-            }
-          )
+        upload_parquet!(base_req, s3, processed_key, parquet_path, parquet_bytes)
 
         parquet_bytes
       else
@@ -88,9 +81,67 @@ defmodule W3.Compactor do
     }
   end
 
-  defp processed_key(raw_keys) do
+  defp compact_parquet_files_into_one(s3, parquet_keys) do
+    base_req = S3.base_req(s3)
+    parquet_paths = download_objects(base_req, s3, parquet_keys, "parquet", :infinity)
+    parquet_bytes = Enum.sum_by(parquet_paths, &File.stat!(&1).size)
+    output_path = Plug.Upload.random_file!("parquet")
+    row_count = copy_parquet_to_parquet(parquet_paths, output_path)
+    output_bytes = File.stat!(output_path).size
+    output_key = processed_key(parquet_keys)
+
+    upload_parquet!(base_req, s3, output_key, output_path, output_bytes)
+    S3.delete_objects!(s3, parquet_keys)
+
+    %{
+      parquet_files: length(parquet_keys),
+      parquet_bytes: parquet_bytes,
+      rows: row_count,
+      output_bytes: output_bytes
+    }
+  end
+
+  defp download_objects(base_req, s3, keys, name, timeout) do
+    keys
+    |> Enum.map(fn key ->
+      # Plug deletes files when their owner exits, so the parent task owns each download.
+      %{key: key, path: Plug.Upload.random_file!(name)}
+    end)
+    |> W3.async_map!(
+      fn %{key: key, path: path} = object ->
+        %{status: 200} =
+          Req.get!(base_req,
+            url: S3.object_url(s3, key),
+            into: File.stream!(path, [:delayed_write]),
+            raw: true
+          )
+
+        object
+      end,
+      ordered: false,
+      timeout: timeout,
+      max_concurrency: System.schedulers_online() * 4
+    )
+    |> Enum.sort_by(& &1.key)
+    |> Enum.map(& &1.path)
+  end
+
+  defp upload_parquet!(base_req, s3, key, path, bytes) do
+    %{status: 200} =
+      Req.put!(
+        base_req,
+        url: S3.object_url(s3, key),
+        body: File.stream!(path, @upload_chunk_size, read_ahead: @upload_chunk_size),
+        headers: %{
+          "content-length" => Integer.to_string(bytes),
+          "content-type" => "application/vnd.apache.parquet"
+        }
+      )
+  end
+
+  defp processed_key(source_keys) do
     id =
-      raw_keys
+      source_keys
       |> Enum.sort()
       |> JSON.encode_to_iodata!()
       |> then(&:crypto.hash(:sha256, &1))
@@ -184,6 +235,36 @@ defmodule W3.Compactor do
           )
           """,
           %{"raw_paths" => JSON.encode!(raw_paths)}
+        )
+
+      row_count
+    end)
+  end
+
+  def copy_parquet_to_parquet(parquet_paths, output_path) do
+    Duck.with_duck(fn conn ->
+      Duck.query(conn, "SET temp_directory = #{Duck.quote(Path.dirname(output_path))}")
+
+      %{"Count" => [row_count]} =
+        Duck.query(
+          conn,
+          """
+          COPY (
+            SELECT DISTINCT *
+            FROM read_parquet(
+              from_json(CAST($parquet_paths AS VARCHAR), '["VARCHAR"]'),
+              hive_partitioning = false,
+              union_by_name = true
+            )
+            ORDER BY time, entity
+          ) TO #{Duck.quote(output_path)} (
+            FORMAT PARQUET,
+            COMPRESSION ZSTD,
+            PARQUET_VERSION V2,
+            ROW_GROUP_SIZE 8192
+          )
+          """,
+          %{"parquet_paths" => JSON.encode!(parquet_paths)}
         )
 
       row_count

@@ -16,8 +16,13 @@ defmodule W3.Application do
       {Task.Supervisor, name: W3.task_supervisor()},
       {W3.Endpoint, port: port, api_key: api_key, s3: s3},
       {W3.Periodic,
+       id: :raw_compactor,
        interval: to_timeout(minute: 30),
-       task: fn -> W3.Compactor.compact_raw_files_into_parquet(s3) end}
+       task: fn -> W3.Compactor.compact_raw_files_into_parquet(s3) end},
+      {W3.Periodic,
+       id: :parquet_compactor,
+       interval: to_timeout(day: 1),
+       task: fn -> W3.Compactor.compact_parquet_files_into_one(s3) end}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: W3.Supervisor)
