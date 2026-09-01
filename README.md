@@ -66,9 +66,10 @@ deterministic key makes a retry of the same snapshot overwrite the same object.
 
 A second compactor also runs at startup and then one day after each successful run. When at least
 two Parquet files exist, it snapshots `processed/`, downloads those files concurrently, unions their
-schemas, removes exact duplicate rows, and writes one replacement ordered by `time`, then `entity`.
-It uploads the replacement before deleting exactly the snapshotted files, so Parquet files created
-during the run remain for the next pass. Zero- and one-file snapshots are left unchanged.
+schemas, removes exact duplicate source rows, resolves fallback metadata, and writes one replacement
+ordered by event time. It uploads the replacement before deleting exactly the snapshotted files, so
+Parquet files created during the run remain for the next pass. Zero- and one-file snapshots are left
+unchanged.
 
 Rows missing `time`, `entity`, `type`, or `machine_name` are discarded; an all-invalid snapshot
 produces no Parquet object. Malformed typed values fail raw compaction and leave its snapshot
@@ -123,8 +124,71 @@ ORDER BY year;
 Deduplicate across files because WakaTime may regroup retried heartbeats into different raw batches,
 new batches can coexist with the latest daily compacted file, and a partial source-deletion failure
 can leave overlap between runs. Daily Parquet compaction removes exact duplicates within its own
-snapshot. Fallback values such as `<<LAST_PROJECT>>`, `<<LAST_BRANCH>>`, and `<<LAST_LANGUAGE>>`
-remain literal; resolve them with event-time history in the query layer when needed.
+snapshot before calculating derived columns.
+
+The source `project`, `branch`, and `language` columns keep fallback literals such as
+`<<LAST_PROJECT>>`, `<<LAST_BRANCH>>`, and `<<LAST_LANGUAGE>>`. Daily compaction materializes their
+event-time values as `resolved_project`, `resolved_branch`, and `resolved_language`, preserving the
+source columns so a later out-of-order heartbeat can repair earlier results. Project fallback and
+the `previous_heartbeat_at` and `next_heartbeat_at` adjacency columns use one global heartbeat stream
+across machines. Branch and language fallbacks use the history of the resolved project, preventing
+one project's branch or language from leaking into another. Equal-time heartbeats do not provide
+fallback state to each other. Use `next_heartbeat_at - time` for duration attribution and
+`time - previous_heartbeat_at` to identify session starts after an idle timeout.
+
+Run derived analytics after a successful daily Parquet compaction; newer raw-compaction fragments
+receive resolved metadata and global adjacency during the next daily pass. For example, total active
+seconds by project with a configurable five-minute idle cutoff:
+
+```sql
+WITH heartbeat AS (
+  SELECT *
+  FROM read_parquet(
+    's3://w3/processed/*.parquet',
+    hive_partitioning = false,
+    union_by_name = true
+  )
+  WHERE time >= TIMESTAMPTZ '2026-01-01 00:00:00+00'
+    AND time <  TIMESTAMPTZ '2027-01-01 00:00:00+00'
+)
+SELECT
+  coalesce(resolved_project, '(none)') AS project,
+  coalesce(
+    sum(epoch(next_heartbeat_at - time)) FILTER (
+      WHERE next_heartbeat_at - time < INTERVAL '5 minutes'
+    ),
+    0
+  ) AS seconds
+FROM heartbeat
+GROUP BY resolved_project
+ORDER BY seconds DESC;
+```
+
+Find session starts inside a bounded range without scanning for a preceding row outside that range:
+
+```sql
+WITH heartbeat AS (
+  SELECT *
+  FROM read_parquet(
+    's3://w3/processed/*.parquet',
+    hive_partitioning = false,
+    union_by_name = true
+  )
+)
+SELECT
+  time AS session_started_at,
+  resolved_project,
+  resolved_branch,
+  machine_name
+FROM heartbeat
+WHERE time >= TIMESTAMPTZ '2026-08-01 00:00:00+00'
+  AND time <  TIMESTAMPTZ '2026-09-01 00:00:00+00'
+  AND (
+    previous_heartbeat_at IS NULL
+    OR time - previous_heartbeat_at >= INTERVAL '5 minutes'
+  )
+ORDER BY time;
+```
 
 ## Development
 

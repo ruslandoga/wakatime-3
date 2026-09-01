@@ -380,6 +380,9 @@ defmodule W3.CompactorTest do
           SELECT
             TIMESTAMPTZ '2025-02-01 00:00:00+00' AS time,
             'synthetic/late.ex'::VARCHAR AS entity,
+            'synthetic'::VARCHAR AS project,
+            'main'::VARCHAR AS branch,
+            'Elixir'::VARCHAR AS language,
             1::BIGINT AS old_value
         ) TO #{W3.Duck.quote(first_path)} (FORMAT PARQUET)
         """
@@ -392,7 +395,10 @@ defmodule W3.CompactorTest do
           SELECT
             'synthetic/early.ex'::VARCHAR AS entity,
             2::BIGINT AS new_value,
-            TIMESTAMPTZ '2025-01-01 00:00:00+00' AS time
+            TIMESTAMPTZ '2025-01-01 00:00:00+00' AS time,
+            'synthetic'::VARCHAR AS project,
+            'main'::VARCHAR AS branch,
+            'Elixir'::VARCHAR AS language
         ) TO #{W3.Duck.quote(second_path)} (FORMAT PARQUET)
         """
       )
@@ -416,6 +422,177 @@ defmodule W3.CompactorTest do
                "entity" => ["synthetic/early.ex", "synthetic/late.ex"],
                "old_value" => [nil, 1],
                "new_value" => [2, nil]
+             }
+    end)
+  end
+
+  test "resolves fallback fields and global heartbeat adjacency across rewrites", %{
+    tmp_dir: tmp_dir
+  } do
+    initial_raw_path = Path.join(tmp_dir, "initial.ndjson.zst")
+    initial_path = Path.join(tmp_dir, "initial.parquet")
+    first_compacted_path = Path.join(tmp_dir, "first-compacted.parquet")
+    late_raw_path = Path.join(tmp_dir, "late.ndjson.zst")
+    late_path = Path.join(tmp_dir, "late.parquet")
+    output_path = Path.join(tmp_dir, "output.parquet")
+    initial_time = 1_700_000_000
+
+    first =
+      heartbeat(
+        time: initial_time,
+        entity: "synthetic/1.ex",
+        machine_name: "machine-a",
+        project: "alpha",
+        branch: "main",
+        language: "Elixir"
+      )
+
+    third =
+      heartbeat(
+        time: initial_time + 2,
+        entity: "synthetic/3.ex",
+        machine_name: "machine-a",
+        project: "<<LAST_PROJECT>>",
+        branch: "<<LAST_BRANCH>>",
+        language: "<<LAST_LANGUAGE>>"
+      )
+
+    write_raw!(initial_raw_path, [third, first])
+    assert 2 = W3.Compactor.copy_raw_to_parquet([initial_raw_path], initial_path)
+    assert 2 = W3.Compactor.copy_parquet_to_parquet([initial_path], first_compacted_path)
+
+    W3.Duck.with_duck(fn conn ->
+      assert W3.Duck.query(
+               conn,
+               """
+               SELECT
+                 resolved_project,
+                 epoch(previous_heartbeat_at)::BIGINT AS previous_epoch,
+                 epoch(next_heartbeat_at)::BIGINT AS next_epoch
+               FROM read_parquet(#{W3.Duck.quote(first_compacted_path)})
+               WHERE entity = 'synthetic/3.ex'
+               """
+             ) == %{
+               "next_epoch" => [nil],
+               "previous_epoch" => [initial_time],
+               "resolved_project" => ["alpha"]
+             }
+    end)
+
+    second =
+      heartbeat(
+        time: initial_time + 1,
+        entity: "synthetic/2-concrete.ex",
+        machine_name: "machine-b",
+        project: "beta",
+        branch: "dev",
+        language: "Rust"
+      )
+
+    same_time_fallback =
+      heartbeat(
+        time: initial_time + 1,
+        entity: "synthetic/2-fallback.ex",
+        machine_name: "machine-a",
+        project: "<<LAST_PROJECT>>",
+        branch: "<<LAST_BRANCH>>",
+        language: "<<LAST_LANGUAGE>>"
+      )
+
+    fourth =
+      heartbeat(
+        time: initial_time + 3,
+        entity: "synthetic/4.ex",
+        machine_name: "machine-a",
+        project: "alpha",
+        branch: "<<LAST_BRANCH>>",
+        language: "<<LAST_LANGUAGE>>"
+      )
+
+    write_raw!(late_raw_path, [fourth, same_time_fallback, second, first])
+    assert 4 = W3.Compactor.copy_raw_to_parquet([late_raw_path], late_path)
+
+    assert 5 =
+             W3.Compactor.copy_parquet_to_parquet(
+               [first_compacted_path, late_path],
+               output_path
+             )
+
+    W3.Duck.with_duck(fn conn ->
+      assert W3.Duck.query(
+               conn,
+               """
+               SELECT
+                 entity,
+                 machine_name,
+                 project,
+                 branch,
+                 language,
+                 resolved_project,
+                 resolved_branch,
+                 resolved_language,
+                 epoch(previous_heartbeat_at)::BIGINT AS previous_epoch,
+                 epoch(next_heartbeat_at)::BIGINT AS next_epoch
+               FROM read_parquet(
+                 #{W3.Duck.quote(output_path)},
+                 file_row_number = true,
+                 hive_partitioning = false
+               )
+               ORDER BY file_row_number
+               """
+             ) == %{
+               "entity" => [
+                 "synthetic/1.ex",
+                 "synthetic/2-concrete.ex",
+                 "synthetic/2-fallback.ex",
+                 "synthetic/3.ex",
+                 "synthetic/4.ex"
+               ],
+               "machine_name" => [
+                 "machine-a",
+                 "machine-b",
+                 "machine-a",
+                 "machine-a",
+                 "machine-a"
+               ],
+               "project" => [
+                 "alpha",
+                 "beta",
+                 "<<LAST_PROJECT>>",
+                 "<<LAST_PROJECT>>",
+                 "alpha"
+               ],
+               "branch" => [
+                 "main",
+                 "dev",
+                 "<<LAST_BRANCH>>",
+                 "<<LAST_BRANCH>>",
+                 "<<LAST_BRANCH>>"
+               ],
+               "language" => [
+                 "Elixir",
+                 "Rust",
+                 "<<LAST_LANGUAGE>>",
+                 "<<LAST_LANGUAGE>>",
+                 "<<LAST_LANGUAGE>>"
+               ],
+               "resolved_project" => ["alpha", "beta", "alpha", "beta", "alpha"],
+               "resolved_branch" => ["main", "dev", "main", "dev", "main"],
+               "resolved_language" => ["Elixir", "Rust", "Elixir", "Rust", "Elixir"],
+               "next_epoch" => [
+                 initial_time + 1,
+                 initial_time + 1,
+                 initial_time + 2,
+                 initial_time + 3,
+                 nil
+               ],
+               "previous_epoch" => [
+                 nil,
+                 initial_time,
+                 initial_time + 1,
+                 initial_time + 1,
+                 initial_time + 2
+               ]
              }
     end)
   end
@@ -569,6 +746,15 @@ defmodule W3.CompactorTest do
       |> :zstd.compress()
 
     put_object!(request, bucket, key, body)
+  end
+
+  defp write_raw!(path, heartbeats) do
+    body =
+      heartbeats
+      |> Enum.map(&[JSON.encode_to_iodata!(&1), ?\n])
+      |> :zstd.compress()
+
+    File.write!(path, body)
   end
 
   defp put_object!(request, bucket, key, body) do

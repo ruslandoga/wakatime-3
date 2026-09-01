@@ -250,13 +250,96 @@ defmodule W3.Compactor do
           conn,
           """
           COPY (
-            SELECT DISTINCT *
-            FROM read_parquet(
-              from_json(CAST($parquet_paths AS VARCHAR), '["VARCHAR"]'),
-              hive_partitioning = false,
-              union_by_name = true
+            WITH source_event AS (
+              SELECT COLUMNS(lambda column_name: column_name NOT IN (
+                'resolved_project',
+                'resolved_branch',
+                'resolved_language',
+                'previous_heartbeat_at',
+                'next_heartbeat_at'
+              ))
+              FROM read_parquet(
+                from_json(CAST($parquet_paths AS VARCHAR), '["VARCHAR"]'),
+                hive_partitioning = false,
+                union_by_name = true
+              )
+            ), event AS (
+              SELECT DISTINCT *
+              FROM source_event
+            ), ordered_event AS (
+              SELECT *, md5(to_json(event)) AS event_order
+              FROM event
+            ), project_resolved AS (
+              SELECT
+                *,
+                CASE
+                  WHEN project = '<<LAST_PROJECT>>' THEN
+                    arg_max(
+                      project,
+                      struct_pack(event_time := time, event_order := event_order)
+                    ) FILTER (
+                      WHERE project IS NOT NULL
+                        AND project <> ''
+                        AND project <> '<<LAST_PROJECT>>'
+                    ) OVER (
+                      ORDER BY time
+                      RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                      EXCLUDE GROUP
+                    )
+                  ELSE project
+                END AS resolved_project,
+                lag(time) OVER (
+                  ORDER BY time, entity, event_order
+                ) AS previous_heartbeat_at,
+                lead(time) OVER (
+                  ORDER BY time, entity, event_order
+                ) AS next_heartbeat_at
+              FROM ordered_event
+            ), resolved_event AS (
+              SELECT
+                *,
+                CASE
+                  WHEN branch = '<<LAST_BRANCH>>' AND nullif(resolved_project, '') IS NOT NULL THEN
+                    arg_max(
+                      branch,
+                      struct_pack(event_time := time, event_order := event_order)
+                    ) FILTER (
+                      WHERE branch IS NOT NULL
+                        AND branch <> ''
+                        AND branch <> '<<LAST_BRANCH>>'
+                    ) OVER (
+                      PARTITION BY resolved_project
+                      ORDER BY time
+                      RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                      EXCLUDE GROUP
+                    )
+                  WHEN branch = '<<LAST_BRANCH>>' THEN NULL
+                  ELSE branch
+                END AS resolved_branch,
+                CASE
+                  WHEN language = '<<LAST_LANGUAGE>>' AND
+                       nullif(resolved_project, '') IS NOT NULL THEN
+                    arg_max(
+                      language,
+                      struct_pack(event_time := time, event_order := event_order)
+                    ) FILTER (
+                      WHERE language IS NOT NULL
+                        AND language <> ''
+                        AND language <> '<<LAST_LANGUAGE>>'
+                    ) OVER (
+                      PARTITION BY resolved_project
+                      ORDER BY time
+                      RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                      EXCLUDE GROUP
+                    )
+                  WHEN language = '<<LAST_LANGUAGE>>' THEN NULL
+                  ELSE language
+                END AS resolved_language
+              FROM project_resolved
             )
-            ORDER BY time, entity
+            SELECT * EXCLUDE (event_order)
+            FROM resolved_event
+            ORDER BY time, entity, event_order
           ) TO #{Duck.quote(output_path)} (
             FORMAT PARQUET,
             COMPRESSION ZSTD,
