@@ -16,17 +16,29 @@ defmodule W3.ApplicationTest do
            }
   end
 
-  test "starts endpoint from runtime config" do
+  test "starts endpoint and compactors from runtime config" do
     children = Supervisor.which_children(W3.Supervisor)
+    raw_interval = to_timeout(minute: 30)
+    parquet_interval = to_timeout(day: 1)
 
     assert {W3.TaskSupervisor, tasks, :supervisor, _} =
              List.keyfind(children, W3.TaskSupervisor, 0)
 
     assert {W3.Endpoint, endpoint, :supervisor, _} = List.keyfind(children, W3.Endpoint, 0)
-    assert {W3.Periodic, periodic, :worker, _} = List.keyfind(children, W3.Periodic, 0)
+
+    assert {:raw_compactor, raw_compactor, :worker, [W3.Periodic]} =
+             List.keyfind(children, :raw_compactor, 0)
+
+    assert {:parquet_compactor, parquet_compactor, :worker, [W3.Periodic]} =
+             List.keyfind(children, :parquet_compactor, 0)
 
     assert Process.alive?(tasks)
-    assert Process.alive?(periodic)
+    assert Process.alive?(raw_compactor)
+    assert Process.alive?(parquet_compactor)
+    assert {_state, %{interval: ^raw_interval}} = :sys.get_state(raw_compactor)
+
+    assert {_state, %{interval: ^parquet_interval}} = :sys.get_state(parquet_compactor)
+
     assert {:ok, {_ip, port}} = ThousandIsland.listener_info(endpoint)
     assert is_integer(port)
   end

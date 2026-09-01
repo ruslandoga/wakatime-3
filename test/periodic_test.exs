@@ -1,6 +1,17 @@
 defmodule W3.PeriodicTest do
   use ExUnit.Case, async: true
 
+  test "uses and removes a configured child id" do
+    task = fn -> :ok end
+
+    assert %{id: :parquet_compactor, start: {W3.Periodic, :start_link, [options]}} =
+             W3.Periodic.child_spec(id: :parquet_compactor, interval: 10, task: task)
+
+    refute Keyword.has_key?(options, :id)
+    assert Keyword.fetch!(options, :interval) == 10
+    assert Keyword.fetch!(options, :task) == task
+  end
+
   test "starts immediately and does not overlap runs" do
     test = self()
 

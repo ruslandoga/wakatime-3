@@ -23,13 +23,15 @@ defmodule W3.LoggerTelemetryHandler do
 
   def handle_event([:w3, :compact, :stop], measurements, metadata, _config) do
     Logger.info(fn ->
-      "heartbeat compaction complete in #{duration(measurements)}ms for #{metadata.bucket}"
+      "#{job_name(metadata)} compaction complete in #{duration(measurements)}ms " <>
+        "for #{metadata.bucket}"
     end)
   end
 
   def handle_event([:w3, :compact, :exception], measurements, metadata, _config) do
     Logger.error(fn ->
-      "heartbeat compaction failed after #{duration(measurements)}ms for #{metadata.bucket}:\n" <>
+      "#{job_name(metadata)} compaction failed after #{duration(measurements)}ms " <>
+        "for #{metadata.bucket}:\n" <>
         format_error(metadata)
     end)
   end
@@ -60,6 +62,9 @@ defmodule W3.LoggerTelemetryHandler do
   defp duration(duration) when is_integer(duration) do
     System.convert_time_unit(duration, :native, :millisecond)
   end
+
+  defp job_name(%{job: :parquet}), do: "Parquet"
+  defp job_name(_metadata), do: "heartbeat"
 
   defp format_error(%{kind: kind, reason: reason, stacktrace: stacktrace}) do
     Exception.format(kind, reason, stacktrace)
